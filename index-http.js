@@ -3672,7 +3672,7 @@ async function tool_send_email(args) {
     const SENDER_TEMPLATES = {
         consulting: {
             name: "Steve Elliott (Harvard University, Statistics)",
-            email: "your-email@example.com"
+            email: process.env.SIGNATURE_EMAIL
         },
         professional: {
             name: "Steve Elliott",
@@ -3751,8 +3751,8 @@ async function tool_send_email(args) {
 <i style="font-family: Arial, Helvetica, sans-serif; font-size: 10.5pt; line-height: 1.3;">Independent Statistical Consultant — Research & Evaluation</i><br>
 <span style="font-family: Georgia, serif; font-size: 10.5pt; line-height: 1.3;">A.B., Harvard University — Statistics</span><br>
 <span style="font-family: Arial, Helvetica, sans-serif; font-size: 10pt; line-height: 1.3;">
-📧 <a href="mailto:your-email@example.com" style="color:#1a0dab; text-decoration:underline;">your-email@example.com</a><br>
-🔗 <a href="https://www.linkedin.com/in/your-profile/" target="_blank" style="color:#1a0dab; text-decoration:underline;">LinkedIn</a>
+📧 <a href="mailto:${process.env.SIGNATURE_EMAIL}" style="color:#1a0dab; text-decoration:underline;">${process.env.SIGNATURE_EMAIL}</a><br>
+🔗 <a href="${process.env.SIGNATURE_LINKEDIN}" target="_blank" style="color:#1a0dab; text-decoration:underline;">LinkedIn</a>
 </span>
 `,
 
@@ -5667,7 +5667,7 @@ app.post('/nl-command', async (req, res) => {
             const to = toMatch ? toMatch[1] : null;
             const subject = subjectMatch ? subjectMatch[1] : 'No subject';
             const bodyText = bodyMatch ? bodyMatch[1] : 'Hello!';
-            const sendAs = aliasMatch ? aliasMatch[1] : 'your-email@example.com'; // 👈 default Gmail
+            const sendAs = aliasMatch ? aliasMatch[1] : process.env.SIGNATURE_EMAIL; // 👈 default Gmail
 
             if (!to) return res.status(400).json({ error: 'Missing recipient (to:)' });
 

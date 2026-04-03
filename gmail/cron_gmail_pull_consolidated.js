@@ -7,7 +7,7 @@
 
 import { callTool } from "./mcp.js";
 
-const MY_EMAIL = "your-email@example.com";
+const MY_EMAIL = process.env.SIGNATURE_EMAIL || process.env.MCP_FROM_EMAIL_HARVARD;
 
 /* -------------------------------------------------------------------------- */
 /* 🧠 Utility Functions                                                       */
