@@ -675,7 +675,7 @@ globalThis.callTool = async function callTool(name, args = {}) {
     const MCP_SERVER_URL =
         process.env.MCP_URL ||
         process.env.MCP_SERVER_URL ||
-        "https://mcp.mcp-server.fyi/sse";
+        `${process.env.MCP_PUBLIC_URL}/sse`;
 
     const payload = { name, arguments: args };
 
@@ -3676,11 +3676,11 @@ async function tool_send_email(args) {
         },
         professional: {
             name: "Steve Elliott",
-            email: "your-email@example.com"
+            email: process.env.MCP_FROM_EMAIL_HARVARD
         },
         basic: {
             name: "Steve Elliott",
-            email: "your-gmail@example.com"
+            email: process.env.MCP_FROM_EMAIL_GMAIL
         }
     };
 
@@ -3824,7 +3824,7 @@ Steve Elliott
 
     // --- Add tracking pixel if tracking is enabled ---
     if (shouldTrack) {
-        const pixelUrl = `https://your-supabase-ref.supabase.co/functions/v1/track_email_open?tag=${tag}`;
+        const pixelUrl = `https://${process.env.SUPABASE_PROJECT_REF}.supabase.co/functions/v1/track_email_open?tag=${tag}`;
         const pixelHtml = `<img src="${pixelUrl}" width="1" height="1" style="display:none;" alt="">`;
 
         if (/<\/body>/i.test(finalBody)) {
