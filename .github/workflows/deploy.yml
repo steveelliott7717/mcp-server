@@ -1,0 +1,59 @@
+name: deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to MCP server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.MCP_SERVER_HOST }}
+          username: ${{ secrets.MCP_SERVER_USER }}
+          key: ${{ secrets.MCP_SERVER_SSH_KEY }}
+          port: 22
+          timeout: 30s
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            cd /opt/supabase-mcp/custom
+            git pull origin main
+            npm install --omit=dev
+            sudo systemctl restart mcp-server
+
+      - name: Smoke test /health
+        run: |
+          for i in {1..15}; do
+            code=$(curl -sk -o /dev/null -w "%{http_code}" https://mcp.mcp-server.fyi/health || true)
+            if [ "$code" = "200" ]; then
+              echo "Health OK"
+              exit 0
+            fi
+            echo "Waiting... got $code"
+            sleep 2
+          done
+          echo "Health check failed"
+          exit 1
+
+      - name: Service logs on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.MCP_SERVER_HOST }}
+          username: ${{ secrets.MCP_SERVER_USER }}
+          key: ${{ secrets.MCP_SERVER_SSH_KEY }}
+          port: 22
+          timeout: 30s
+          command_timeout: 5m
+          script: |
+            journalctl -u mcp-server -n 50 --no-pager || true
