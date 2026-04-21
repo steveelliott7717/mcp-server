@@ -342,7 +342,7 @@ async function processBeforeEventNotifications(runId) {
 
     // Get current time
     const now = new Date();
-    const lookAheadWindow = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2 hours ahead
+    const lookAheadWindow = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours ahead
 
     // Query both tables
     const rows = await queryBothEventTables(

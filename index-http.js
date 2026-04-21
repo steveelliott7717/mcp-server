@@ -200,6 +200,31 @@ async function maybeInjectAviasalesToken(args) {
 }
 // --- end Aviasales Token Auto-Injector ---
 
+// --- Facebook Token Auto-Injector ---
+async function maybeInjectFacebookToken(args) {
+    try {
+        const u = new URL(args.url);
+        if (u.hostname !== 'graph.facebook.com') return args;
+
+        const token = process.env.FB_API_Key;
+        if (!token) {
+            console.error('[FB TOKEN INJECT] FB_API_Key not set in environment.');
+            return args;
+        }
+
+        // Inject as query param (Graph API standard)
+        const sep = args.url.includes('?') ? '&' : '?';
+        args.url = `${args.url}${sep}access_token=${token}`;
+
+        console.error(`[FB TOKEN INJECT] Injected token for ${u.hostname}`);
+        return args;
+    } catch (err) {
+        console.error('[FB TOKEN INJECT] Failed:', err);
+        return args;
+    }
+}
+// --- end Facebook Token Auto-Injector ---
+
 
 // --- GitHub Token Refresher ---
 const GITHUB_TOKEN_PATH = "/opt/supabase-mcp/secrets/github_token.json";
@@ -837,6 +862,7 @@ async function callOneToolByName(name, args) {
     else if (name === 'tool_run_check') return tool_run_check(args);
     else if (name === 'tool_commit_file') return tool_commit_file(args);
     else if (name === "send_email") return tool_send_email(args);
+    else if (name === "facebook_messages") return tool_facebook_messages(args);
     else if (name === 'http_fetch') return tool_http_fetch(args);
     else if (name === 'notify_push') return tool_notify_push(args);
     else if (name === 'browser_flow') return tool_browser_flow(args);
@@ -1660,6 +1686,7 @@ app.post('/sse', async (req, res) => {
             else if (name === "tool_commit_file") content = await tool_commit_file(args);
             else if (name === 'manage_cron_job') content = await tool_manage_cron_job(args);
             else if (name === "send_email") content = await tool_send_email(args);
+            else if (name === "facebook_messages") content = await tool_facebook_messages(args);
             else if (name === 'http_fetch') content = await tool_http_fetch(args);
             else if (name === 'notify_push') content = await tool_notify_push(args);
             else if (name === 'browser_flow') content = await tool_browser_flow(args);
@@ -1848,7 +1875,13 @@ function applyWhere(q, where) {
     if (where && typeof where === 'object' && (where.op || where.conditions)) { const token = serializeBoolExpr(where); return token ? q.or(token) : q; }
     for (const [col, spec] of Object.entries(where || {})) {
         if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) { q = q.eq(col, spec); continue; }
-        const iop = (spec.op || Object.keys(spec).find(k => k !== 'cast' && k !== 'value') || 'eq').toLowerCase();
+        // Multi-key shorthand: {"gte": "a", "lte": "b"} — apply each operator separately
+        const specOpKeys = spec.op == null ? Object.keys(spec).filter(k => k !== 'cast' && k !== 'value') : null;
+        if (specOpKeys && specOpKeys.length > 1) {
+            for (const opKey of specOpKeys) { q = applyWhere(q, { [col]: { op: opKey, value: spec[opKey] } }); }
+            continue;
+        }
+        const iop = (spec.op || (specOpKeys && specOpKeys[0]) || 'eq').toLowerCase();
         if (!VALID_OPS.has(iop) && !/_any$/.test(iop)) {
             throw new Error(`invalid_operator: unknown operator '${iop}' on column '${col}'. Valid operators: ${[...VALID_OPS].join(', ')}`);
         }
@@ -1864,6 +1897,7 @@ function applyWhere(q, where) {
         if (/_any$/.test(iop)) { const token = serializeLeaf(col, { op: iop, value: val }); if (token) q = q.or(token); continue; }
         if (val === null && (iop === 'eq' || iop === '=')) { q = q.is(col, null); continue; }
         if (val === null && (iop === 'ne' || iop === 'neq' || iop === '!=')) { q = q.not(col, 'is', null); continue; }
+        if (iop === 'ne' || iop === 'neq' || iop === '!=') { q = q.neq(col, val); continue; }
         if (iop === 'in') { q = Array.isArray(val) ? q.in(col, val) : q; continue; }
         if (iop === 'not_in') { q = q.filter(col, 'not.in', `(${(val || []).join(',')})`); continue; }
         if (iop === 'between') { const [a, b] = val || []; q = q.gte(col, a).lte(col, b); continue; }
@@ -2201,6 +2235,29 @@ function toolsPayload(){
                   }
               },
               required: ['relpath', 'start_line', 'end_line', 'new_lines']
+          }
+      },
+      {
+          name: 'facebook_messages',
+          description: 'Interact with Facebook Marketplace conversations via the Messenger Platform API. Actions: list_conversations, get_thread, send_reply, get_profile.',
+          inputSchema: {
+              type: 'object',
+              additionalProperties: true,
+              properties: {
+                  action: {
+                      type: 'string',
+                      enum: ['list_conversations', 'get_thread', 'send_reply', 'get_profile'],
+                      description: 'list_conversations: fetch open Marketplace threads; get_thread: fetch messages in a conversation; send_reply: send a message to a buyer; get_profile: get buyer name/profile pic'
+                  },
+                  page_id: { type: 'string', description: 'Facebook Page ID (defaults to "me")' },
+                  conversation_id: { type: 'string', description: 'Conversation ID — required for get_thread and send_reply' },
+                  recipient_id: { type: 'string', description: 'Buyer PSID — required for send_reply' },
+                  message: { type: 'string', description: 'Text to send — required for send_reply' },
+                  user_id: { type: 'string', description: 'Buyer PSID — required for get_profile' },
+                  limit: { type: 'number', description: 'Max results to return (default 20)' },
+                  after: { type: 'string', description: 'Pagination cursor' },
+              },
+              required: ['action']
           }
       },
       {
@@ -3200,7 +3257,7 @@ async function tool_update_data(args) {
             if (got.length === 1) {
                 const g = got[0];
                 verified = Object.entries(patch).every(([k, v]) =>
-                (v && typeof v === "object") ? true : (g[k] === v || v === null)
+                (v && typeof v === "object") ? true : (g[k] === v || v === null || String(g[k]) === String(v))
                 );
                 rows = got;
             }
@@ -3239,7 +3296,7 @@ async function tool_update_data(args) {
                 urows = proj2?.data ?? urows;
                 const g2 = (proj2?.data ?? [])[0];
                 verified = !!g2 && Object.entries(patch).every(([k, v]) =>
-                    (v && typeof v === "object") ? true : (g2[k] === v || v === null)
+                    (v && typeof v === "object") ? true : (g2[k] === v || v === null || String(g2[k]) === String(v))
                 );
                 } else {
                 verified = Array.isArray(urows) && urows.length > 0;
@@ -3598,6 +3655,89 @@ async function tool_get_trigger_definition(args) {
 // ✅ Ingest cron handles all tracking activation
 // 🔧 FIX: No longer defaults To: field to user's own email
 // 🔧 FIX: Parses attachments if received as JSON string
+//////////////////////////////
+// Facebook Marketplace Messenger
+//////////////////////////////
+const FB_GRAPH = 'https://graph.facebook.com/v25.0';
+
+async function fbGet(path, params = {}) {
+    const token = process.env.FB_API_Key;
+    if (!token) throw new Error('FB_API_Key not set in environment');
+    const qs = new URLSearchParams({ ...params, access_token: token }).toString();
+    const res = await fetch(`${FB_GRAPH}${path}?${qs}`);
+    const json = await res.json();
+    if (json.error) throw new Error(`FB API error: ${json.error.message} (code ${json.error.code})`);
+    return json;
+}
+
+async function fbPost(path, body = {}) {
+    const token = process.env.FB_API_Key;
+    if (!token) throw new Error('FB_API_Key not set in environment');
+    const res = await fetch(`${FB_GRAPH}${path}?access_token=${token}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    const json = await res.json();
+    if (json.error) throw new Error(`FB API error: ${json.error.message} (code ${json.error.code})`);
+    return json;
+}
+
+async function tool_facebook_messages(args) {
+    try {
+        const { action, page_id = '1116933241495616', conversation_id, recipient_id, message, user_id, limit = 20, after } = args || {};
+
+        if (action === 'list_conversations') {
+            // Fetch Page's Marketplace conversations
+            const params = {
+                fields: 'id,updated_time,snippet,participants,tags',
+                limit,
+            };
+            if (after) params.after = after;
+            const data = await fbGet(`/${page_id}/conversations`, params);
+            // Filter to Marketplace threads only (tag = MARKETPLACE or MARKET)
+            const threads = (data.data || []).filter(c => {
+                const tags = c.tags?.data?.map(t => t.name) || [];
+                return tags.some(t => /market/i.test(t)) || true; // include all if no tag filter needed
+            });
+            return asJsonContent({ conversations: threads, paging: data.paging });
+        }
+
+        if (action === 'get_thread') {
+            if (!conversation_id) throw new Error('conversation_id required for get_thread');
+            const data = await fbGet(`/${conversation_id}/messages`, {
+                fields: 'id,message,from,created_time,attachments',
+                limit,
+                ...(after ? { after } : {}),
+            });
+            return asJsonContent({ messages: data.data || [], paging: data.paging });
+        }
+
+        if (action === 'send_reply') {
+            if (!recipient_id) throw new Error('recipient_id (buyer PSID) required for send_reply');
+            if (!message) throw new Error('message required for send_reply');
+            const data = await fbPost('/me/messages', {
+                recipient: { id: recipient_id },
+                message: { text: message },
+                messaging_type: 'RESPONSE',
+            });
+            return asJsonContent({ ok: true, message_id: data.message_id, recipient_id: data.recipient_id });
+        }
+
+        if (action === 'get_profile') {
+            if (!user_id) throw new Error('user_id (buyer PSID) required for get_profile');
+            const data = await fbGet(`/${user_id}`, {
+                fields: 'name,profile_pic,first_name,last_name',
+            });
+            return asJsonContent(data);
+        }
+
+        throw new Error(`Unknown action: ${action}. Valid: list_conversations, get_thread, send_reply, get_profile`);
+
+    } catch (e) {
+        return asJsonContent({ error: 'facebook_messages_error', message: e.message });
+    }
+}
 // 🔧 FIX: HTML formatting now works correctly with attachments
 //////////////////////////////
 async function tool_send_email(args) {
@@ -4443,6 +4583,7 @@ async function tool_http_fetch(args){
   args = await maybeInjectGmailToken(args);
   args = await maybeInjectGithubToken(args);
   args = await maybeInjectAviasalesToken(args);
+  args = await maybeInjectFacebookToken(args);
 
   const started = Date.now();
   const {
