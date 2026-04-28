@@ -4,3 +4,5 @@ gmail/gmail_token.json
 gmail/const/
 *.log
 .claude/
+poshmark/session.json
+poshmark/login_error.png
