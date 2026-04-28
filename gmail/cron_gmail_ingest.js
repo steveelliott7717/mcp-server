@@ -6,7 +6,10 @@
 import dotenv from "dotenv";
 dotenv.config({ path: "/opt/supabase-mcp/custom/.env" });
 
+import fs from "fs";
 import { callTool } from "./mcp.js";
+
+const QUOTA_FLAG = '/tmp/openai_quota_exceeded';
 
 /* -------------------------------------------------------------------------- */
 /* 🧠 Helpers                                                                 */
@@ -132,6 +135,15 @@ async function generateEmbedding(text, retries = 3) {
 
             const parsed = parseHttpFetchResponse(res);
 
+            let errorObj = parsed?.error;
+            if (!errorObj && typeof parsed === 'string') {
+                try { errorObj = JSON.parse(parsed)?.error; } catch {}
+            }
+            if (errorObj?.code === 'insufficient_quota' || errorObj?.type === 'insufficient_quota') {
+                fs.writeFileSync(QUOTA_FLAG, new Date().toISOString());
+                throw new Error('OPENAI_QUOTA_EXCEEDED');
+            }
+
             let vector = null;
             if (parsed?.data?.[0]?.embedding) {
                 vector = parsed.data[0].embedding;
@@ -150,6 +162,7 @@ async function generateEmbedding(text, retries = 3) {
             return null;
 
         } catch (err) {
+            if (err.message === 'OPENAI_QUOTA_EXCEEDED') throw err;
             console.error(`[EMBED RETRY ${i + 1}/${retries}] ${err.message}`);
             if (i < retries - 1) {
                 await new Promise((r) => setTimeout(r, 500 * (i + 1)));
@@ -166,6 +179,12 @@ async function generateEmbedding(text, retries = 3) {
 export async function ingestGmailMessages() {
     const runId = Date.now().toString(36);
     const startedAt = new Date().toISOString();
+
+    if (fs.existsSync(QUOTA_FLAG) && (Date.now() - fs.statSync(QUOTA_FLAG).mtimeMs) < 60 * 60 * 1000) {
+        console.log(`[${startedAt}] ⛔ [${runId}] OpenAI quota flag active — skipping run`);
+        return { inserted: 0, skipped: 0, errors: 0, embedded: 0, tracking_preserved: 0, followup_events_created: 0, total: 0 };
+    }
+
     console.log(`[${startedAt}] 📨 [${runId}] Starting Gmail ingestion`);
 
     let inserted = 0, skipped = 0, errors = 0, embedded = 0, tracking_preserved = 0, followup_events_created = 0;
@@ -225,7 +244,7 @@ export async function ingestGmailMessages() {
         const existingRes = await callTool("query_table", {
             schema: "gmail",
             table: "all_emails",
-            select: ["message_id", "source", "body_html", "embedding"],
+            select: ["message_id", "source", "body_html", "body_text", "subject", "id", "embedding"],
             where: { message_id: { in: messageIds } },
         });
         const existing = parseToolResponse(existingRes) || [];
@@ -236,8 +255,21 @@ export async function ingestGmailMessages() {
             const id = msg.id;
             const existingStub = existingMap.get(id);
 
-            // Skip only if complete (has body content and came from gmail_api)
+            // Fully processed — skip entirely
             if (existingStub && existingStub.source === "gmail_api" && existingStub.body_html && existingStub.embedding) {
+                skipped++;
+                continue;
+            }
+
+            // Ingested but missing embedding — backfill only, no re-upsert
+            if (existingStub && existingStub.source === "gmail_api" && existingStub.body_html && !existingStub.embedding) {
+                if (existingStub.id) {
+                    await embedEmail(runId, existingStub.id, existingStub.subject || '', {
+                        text: existingStub.body_text || '',
+                        html: existingStub.body_html || '',
+                    });
+                    embedded++;
+                }
                 skipped++;
                 continue;
             }
@@ -562,9 +594,50 @@ export async function ingestGmailMessages() {
 
                 await new Promise((r) => setTimeout(r, 100));
             } catch (err) {
+                if (err.message === 'OPENAI_QUOTA_EXCEEDED') {
+                    console.error(`[${runId}] ⛔ OpenAI quota exceeded — aborting batch`);
+                    break;
+                }
                 console.error(`[${runId}] ❌ Error processing ${id}: ${err.message}`);
                 errors++;
             }
+        }
+
+        // Backfill embeddings for older emails (outside the 2-day Gmail query window)
+        try {
+            const unembeddedRes = await callTool("query_table", {
+                schema: "gmail",
+                table: "all_emails",
+                select: ["id", "subject", "body_text", "body_html"],
+                where: {
+                    embedding: { eq: null },
+                    body_html: { neq: null },
+                },
+                limit: 25,
+            });
+            const unembedded = parseToolResponse(unembeddedRes) || [];
+            if (unembedded.length > 0) {
+                console.log(`[${runId}] 🔁 Backfilling embeddings for ${unembedded.length} older emails`);
+                for (const row of unembedded) {
+                    try {
+                        await embedEmail(runId, row.id, row.subject || '', {
+                            text: row.body_text || '',
+                            html: row.body_html || '',
+                        });
+                        embedded++;
+                    } catch (err) {
+                        if (err.message === 'OPENAI_QUOTA_EXCEEDED') {
+                            console.error(`[${runId}] ⛔ OpenAI quota exceeded during backfill — aborting`);
+                            break;
+                        }
+                        console.error(`[${runId}] ❌ Backfill embed failed for ${row.id}: ${err.message}`);
+                        errors++;
+                    }
+                    await new Promise((r) => setTimeout(r, 100));
+                }
+            }
+        } catch (err) {
+            console.error(`[${runId}] ⚠️ Backfill query failed: ${err.message}`);
         }
 
         const summary = { inserted, skipped, errors, embedded, tracking_preserved, followup_events_created, total: allMessages.length };
