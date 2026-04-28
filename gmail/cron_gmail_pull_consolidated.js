@@ -123,12 +123,32 @@ async function pullGmailReplies() {
             const msgs = json.messages || [];
             // 🏷️ Refresh label state for all messages in the thread
             if (Array.isArray(msgs) && msgs.length > 0) {
+                // Fetch current label state for all messages in batch to avoid redundant writes
+                const existingRes = await callTool("query_table", {
+                    schema: "gmail",
+                    table: "all_emails",
+                    select: ["message_id", "is_read", "is_starred", "is_important"],
+                    where: { message_id: { in: msgs.map(m => m.id) } },
+                    limit: msgs.length + 1,
+                });
+                const existingMap = new Map(
+                    (parseToolResponse(existingRes) || []).map(r => [r.message_id, r])
+                );
+
                 for (const m of msgs) {
                     const mid = m.id;
                     const labelIds = m.labelIds || [];
                     const isRead = !labelIds.includes("UNREAD");
                     const isStarred = labelIds.includes("STARRED");
                     const isImportant = labelIds.includes("IMPORTANT");
+
+                    const existing = existingMap.get(mid);
+                    if (existing &&
+                        existing.is_read === isRead &&
+                        existing.is_starred === isStarred &&
+                        existing.is_important === isImportant) {
+                        continue;
+                    }
 
                     try {
                         await callTool("update_data", {
