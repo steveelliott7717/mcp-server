@@ -355,8 +355,8 @@ setInterval(ensureAmadeusTokenFresh, 25 * 60 * 1000);
 
 
 // ====== Playwright Browser Path Override (for MCP isolation fix) ======
-process.env.PLAYWRIGHT_BROWSERS_PATH = "/opt/supabase-mcp/node_modules/playwright/.local-browsers";
-process.env.ICU_DATA = "/opt/supabase-mcp/node_modules/playwright/.local-browsers/chromium_headless_shell-1194/chrome-linux/icudtl.dat";
+process.env.PLAYWRIGHT_BROWSERS_PATH = "/opt/supabase-mcp/custom/ms-playwright";
+process.env.ICU_DATA = "/opt/supabase-mcp/custom/ms-playwright/chromium-1217/chrome-linux64/icudtl.dat";
 process.env.CHROME_HEADLESS_DISABLE_CRASHPAD = "true";
 process.env.HOME = "/home/mcp";
 process.env.DEBUG = (process.env.DEBUG || '') + ',pw:api,pw:browser*';
@@ -815,14 +815,25 @@ function extractScreenshotBase64(flowContent) {
 
 
 function resolveChromiumPath() {
-    const base = '/home/mcp/.cache/ms-playwright';
+    const base = '/opt/supabase-mcp/custom/ms-playwright';
+    // Prefer full chromium over headless shell (headless shell binary isn't accepted by pw.chromium.launch)
+    const candidates = [
+        (dir) => `${base}/${dir}/chrome-linux64/chrome`,
+        (dir) => `${base}/${dir}/chrome-linux/chrome`,
+        (dir) => `${base}/${dir}/chrome-headless-shell-linux64/chrome-headless-shell`,
+    ];
     try {
-        const dirs = fs.readdirSync(base).filter(d => d.startsWith('chromium-'));
-        if (!dirs.length) return null;
-        // pick the newest
-        const pick = dirs.sort().slice(-1)[0];
-        const p = `${base}/${pick}/chrome-linux/chrome`;
-        return fs.existsSync(p) ? p : null;
+        const dirs = fs.readdirSync(base)
+            .filter(d => d.startsWith('chromium-'))
+            .sort()
+            .reverse();
+        for (const dir of dirs) {
+            for (const fn of candidates) {
+                const p = fn(dir);
+                if (fs.existsSync(p)) return p;
+            }
+        }
+        return null;
     } catch {
         return null;
     }
@@ -865,6 +876,7 @@ async function callOneToolByName(name, args) {
     else if (name === "facebook_messages") return tool_facebook_messages(args);
     else if (name === 'http_fetch') return tool_http_fetch(args);
     else if (name === 'notify_push') return tool_notify_push(args);
+    else if (name === 'poshmark_post_comment') return tool_poshmark_post_comment(args);
     else if (name === 'browser_flow') return tool_browser_flow(args);
     else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
         return tool_finalize_verification(args);
@@ -1689,6 +1701,7 @@ app.post('/sse', async (req, res) => {
             else if (name === "facebook_messages") content = await tool_facebook_messages(args);
             else if (name === 'http_fetch') content = await tool_http_fetch(args);
             else if (name === 'notify_push') content = await tool_notify_push(args);
+            else if (name === 'poshmark_post_comment') content = await tool_poshmark_post_comment(args);
             else if (name === 'browser_flow') content = await tool_browser_flow(args);
             else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
                 content = await tool_finalize_verification(args);
@@ -2407,6 +2420,15 @@ function toolsPayload(){
         lang_pool:{type:'array', items:{type:'string'}},
         trace:{type:'boolean'}
       }, required:['url']
+    }},
+
+    { name:'poshmark_post_comment', description:'Post a comment on a Poshmark listing using the saved session', inputSchema:{
+      type:'object',
+      properties:{
+        listing_url:{ type:'string', description:'Full canonical Poshmark listing URL' },
+        comment_text:{ type:'string', description:'Text of the comment to post' },
+      },
+      required:['listing_url','comment_text']
     }},
 
     { name:'notify_push', description:'Send a push/notify event (Slack, Pushover, webhook)', inputSchema:{
@@ -3721,6 +3743,51 @@ async function tool_facebook_messages(args) {
                 message: { text: message },
                 messaging_type: 'RESPONSE',
             });
+
+            // Log sent message to finance.fb_messages
+            try {
+                const MY_PAGE_ID = '1116933241495616';
+                const now = new Date().toISOString();
+
+                // Inherit listing_id from existing thread rows if available
+                let existingListingId = null;
+                if (conversation_id) {
+                    try {
+                        const listingCheck = await callTool('query_table', {
+                            schema: 'finance', table: 'fb_messages',
+                            select: ['listing_id'],
+                            where: { fb_conversation_id: { eq: conversation_id }, listing_id: { not_null: true } },
+                            limit: 1,
+                        });
+                        existingListingId = listingCheck?.content?.[0]
+                            ? JSON.parse(listingCheck.content[0].text)?.rows?.[0]?.listing_id || null
+                            : null;
+                    } catch { /* no existing rows */ }
+                }
+
+                await callTool('upsert_data', {
+                    schema: 'finance',
+                    table: 'fb_messages',
+                    data: {
+                        fb_message_id: data.message_id,
+                        fb_conversation_id: conversation_id || null,
+                        listing_id: existingListingId,
+                        from_name: 'Apartment Sale - Furniture & Household Items',
+                        from_fb_id: MY_PAGE_ID,
+                        body: message,
+                        sent_at: now,
+                        is_from_me: true,
+                        notified_at: now, // no need to notify on own messages
+                        source: 'send_reply',
+                    },
+                    on_conflict: 'fb_message_id',
+                    pk: 'fb_message_id',
+                });
+                console.log(`[facebook_messages] Logged send_reply to DB: ${data.message_id}`);
+            } catch (dbErr) {
+                console.error(`[facebook_messages] DB log failed (send still succeeded): ${dbErr.message}`);
+            }
+
             return asJsonContent({ ok: true, message_id: data.message_id, recipient_id: data.recipient_id });
         }
 
@@ -4811,6 +4878,51 @@ async function tool_http_fetch(args){
  */
 
 //////////////////////////////
+// poshmark_post_comment
+async function tool_poshmark_post_comment(args) {
+    const { listing_url, comment_text } = args;
+    if (!listing_url || !comment_text) throw new Error('listing_url and comment_text are required');
+
+    const SESSION_FILE = '/opt/supabase-mcp/custom/poshmark/session.json';
+    if (!fs.existsSync(SESSION_FILE)) throw new Error('No Poshmark session file — run poshmark_login.js first');
+
+    const { chromium } = await import('playwright');
+    const executablePath = resolveChromiumPath();
+
+    const browser = await chromium.launch({
+        headless: true,
+        executablePath,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+    const context = await browser.newContext({
+        storageState: SESSION_FILE,
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        viewport: { width: 1280, height: 800 },
+    });
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        window.chrome = { runtime: {} };
+    });
+    const page = await context.newPage();
+    try {
+        await page.goto(listing_url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        if (await page.$('a[href="/login"]')) throw new Error('Session expired — run poshmark_login.js to refresh');
+
+        const commentInput = page.locator('input[placeholder="Add your comment..."]');
+        await commentInput.scrollIntoViewIfNeeded();
+        await commentInput.click();
+        await page.waitForTimeout(300);
+        await commentInput.fill(comment_text);
+        await page.waitForTimeout(300);
+        await page.locator('button:has-text("Send")').click();
+        await page.waitForTimeout(2000);
+        await context.storageState({ path: SESSION_FILE });
+        return { ok: true, listing_url, comment_text };
+    } finally {
+        await browser.close();
+    }
+}
+
 // notify_push
 //////////////////////////////
 async function tool_notify_push(args){
@@ -4836,6 +4948,7 @@ async function tool_notify_push(args){
               args.category === 'calendar_events' ? process.env.PUSHOVER_TOKEN_CALENDAR_EVENTS :
                   args.category === 'calendar_recurring' ? process.env.PUSHOVER_TOKEN_CALENDAR_RECURRING :
                       args.category === 'purchases' ? process.env.PUSHOVER_TOKEN_PURCHASES :
+                          args.category === 'facebook_marketplace' ? process.env.PUSHOVER_TOKEN_FACEBOOK_MARKETPLACE :
                           // TODAY
                           args.category === 'today_quick' ? process.env.PUSHOVER_TOKEN_TODAY_QUICK :
                               args.category === 'today_medium' ? process.env.PUSHOVER_TOKEN_TODAY_MEDIUM :
@@ -4846,6 +4959,7 @@ async function tool_notify_push(args){
                                           args.category === 'medium' ? process.env.PUSHOVER_TOKEN_MEDIUM :
                                               args.category === 'deep' ? process.env.PUSHOVER_TOKEN_DEEP :
                                                   args.category === 'projects' ? process.env.PUSHOVER_TOKEN_PROJECTS :
+                                          args.category === 'poshmark' ? process.env.PUSHOVER_TOKEN_POSHMARK :
                       process.env.PUSHOVER_API_TOKEN
       );
       if (!userKey || !apiToken) throw new Error('notify_push: missing Pushover user_key or api_token');
@@ -4910,15 +5024,15 @@ async function tool_browser_flow(args) {
     if (!Array.isArray(steps) || !steps.length) throw new Error('steps[] is required');
 
     const pw = await loadPlaywright();
-    const launchOpts = { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] };
-    const chromePath = resolveChromiumPath();
-
-    console.error('[browser_flow] resolved Chrome path:', chromePath || '(none)');
-
+    // Let playwright auto-select the headless shell (lighter binary, no zygote/GPU process)
+    // Full chromium SIGTRAPs inside the systemd seccomp sandbox; headless shell doesn't.
     const browser = await pw.chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
-        executablePath: chromePath || undefined
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+        ],
     });
 
     console.error('[browser_flow] Chromium launched ✅');
@@ -5005,7 +5119,7 @@ async function tool_browser_flow(args) {
         for (const step of steps) {
             const op = (step.op || '').toLowerCase();
 
-            if (op === 'goto') {
+            if (op === 'goto' || op === 'navigate') {
                 if (!step.url) throw new Error('goto requires url');
                 if (BROWSER_DENY_LOCALHOST) denyLocal(step.url);
                 await page.goto(step.url, { waitUntil: step.wait_until || 'load', timeout: step.timeout_ms || 20000 });
@@ -5049,7 +5163,6 @@ async function tool_browser_flow(args) {
                         dest = await saveToDestination(step.destination, buf, {
                             ...step.destination_opts,
                             contentType: 'image/png',
-                            path: step.destination?.path,
                         });
                     }
 
@@ -5074,7 +5187,6 @@ async function tool_browser_flow(args) {
                         dest = await saveToDestination(step.destination, bytes, {
                             ...step.destination_opts,
                             contentType: 'image/png',
-                            path: step.destination?.path,
                         });
                     }
 
@@ -5139,19 +5251,6 @@ async function tool_browser_flow(args) {
                 const fnBody = String(step.script || 'return null;');
                 const result = await page.evaluate(new Function(fnBody));
                 results.push({ op: 'evaluate', result });
-
-                // --- Node.js multi-page screenshot loop ---
-                await dynamicPageLoop({
-                    waitSelector: '.wd-card',
-                    screenshotOpts: {
-                        full_page: true,
-                        destination_opts: {
-                            bucket: 'screenshots',
-                            path: `uploads/wustl_assistant_jobs_page_${pageNum}.png`
-                        }
-                    },
-                    safetyLimit: 50
-                });
 
             } else if (op === 'extract') {
                 const sel = step.selector;

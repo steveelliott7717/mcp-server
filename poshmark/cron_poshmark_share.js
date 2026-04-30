@@ -64,14 +64,17 @@ async function shareCloset() {
 
         console.log(`[${runId}] 📄 Loaded closet`);
 
-        await page.waitForSelector('[data-et-name="share"][data-et-prop-location="listing_tile"]', { timeout: 15000 });
+        const SHARE_BTN = '[data-et-name="share"][data-et-prop-location="listing_tile"]';
+        await page.waitForSelector(SHARE_BTN, { timeout: 15000 });
 
-        const shareButtons = await page.$$('[data-et-name="share"][data-et-prop-location="listing_tile"]');
-        total = shareButtons.length;
+        total = (await page.$$(SHARE_BTN)).length;
         console.log(`[${runId}] Found ${total} listings`);
 
-        for (let i = 0; i < shareButtons.length; i++) {
-            const btn = shareButtons[i];
+        for (let i = 0; i < total; i++) {
+            // Re-query fresh each iteration — Vue re-renders detach stale handles
+            const btns = await page.$$(SHARE_BTN);
+            if (i >= btns.length) break;
+            const btn = btns[i];
             const listingId = await btn.getAttribute("data-et-prop-listing_id") || "unknown";
 
             try {
@@ -88,7 +91,10 @@ async function shareCloset() {
                 await page.waitForSelector('[data-test="modal-container"]', { timeout: 8000 });
 
                 // Click "To My Followers"
-                await page.click('a.internal-share__link[data-et-name="share_poshmark"]', { timeout: 5000 });
+                const shareTarget = await page.$('a.internal-share__link[data-et-name="share_poshmark"]');
+                const shareText = await shareTarget?.evaluate(el => el.innerText.trim());
+                console.log(`[${runId}] 🖱️ Clicking: "${shareText}"`);
+                await shareTarget.click({ timeout: 5000 });
 
                 // Wait for modal to close
                 await page.waitForSelector('[data-test="modal-container"]', { state: "hidden", timeout: 8000 });
