@@ -876,6 +876,7 @@ async function callOneToolByName(name, args) {
     else if (name === "facebook_messages") return tool_facebook_messages(args);
     else if (name === 'http_fetch') return tool_http_fetch(args);
     else if (name === 'notify_push') return tool_notify_push(args);
+    else if (name === 'poshmark_edit_listing') return tool_poshmark_edit_listing(args);
     else if (name === 'poshmark_post_comment') return tool_poshmark_post_comment(args);
     else if (name === 'browser_flow') return tool_browser_flow(args);
     else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
@@ -1701,6 +1702,7 @@ app.post('/sse', async (req, res) => {
             else if (name === "facebook_messages") content = await tool_facebook_messages(args);
             else if (name === 'http_fetch') content = await tool_http_fetch(args);
             else if (name === 'notify_push') content = await tool_notify_push(args);
+            else if (name === 'poshmark_edit_listing') content = await tool_poshmark_edit_listing(args);
             else if (name === 'poshmark_post_comment') content = await tool_poshmark_post_comment(args);
             else if (name === 'browser_flow') content = await tool_browser_flow(args);
             else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
@@ -2420,6 +2422,17 @@ function toolsPayload(){
         lang_pool:{type:'array', items:{type:'string'}},
         trace:{type:'boolean'}
       }, required:['url']
+    }},
+
+    { name:'poshmark_edit_listing', description:'Edit a Poshmark listing (title, description, price) using the saved session', inputSchema:{
+      type:'object',
+      properties:{
+        listing_url:{ type:'string', description:'Full Poshmark listing URL (or edit-listing URL) — listing ID is extracted automatically' },
+        title:{ type:'string', description:'New listing title (max 80 chars)' },
+        description:{ type:'string', description:'New listing description (max 1500 chars)' },
+        price:{ type:'number', description:'New listing price in USD' },
+      },
+      required:['listing_url']
     }},
 
     { name:'poshmark_post_comment', description:'Post a comment on a Poshmark listing using the saved session', inputSchema:{
@@ -4878,6 +4891,101 @@ async function tool_http_fetch(args){
  */
 
 //////////////////////////////
+// poshmark_edit_listing
+async function tool_poshmark_edit_listing(args) {
+    const { listing_url, title, description, price } = args;
+    if (!listing_url) throw new Error('listing_url is required');
+    if (title === undefined && description === undefined && price === undefined)
+        throw new Error('At least one of title, description, or price must be provided');
+
+    // Extract listing ID from any poshmark listing or edit URL
+    const idMatch = listing_url.match(/([a-f0-9]{24})(?:[/?#]|$)/i)
+        || listing_url.match(/-([a-zA-Z0-9]{20,})(?:[/?#]|$)/);
+    if (!idMatch) throw new Error('Could not extract listing ID from listing_url');
+    const listingId = idMatch[1];
+    const editUrl = `https://poshmark.com/edit-listing/${listingId}`;
+
+    const SESSION_FILE = '/opt/supabase-mcp/custom/poshmark/session.json';
+    if (!fs.existsSync(SESSION_FILE)) throw new Error('No Poshmark session file — run poshmark_login.js first');
+
+    const { chromium } = await import('playwright');
+    const executablePath = '/opt/supabase-mcp/custom/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell';
+
+    const browser = await chromium.launch({
+        headless: true,
+        executablePath,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+    const context = await browser.newContext({
+        storageState: SESSION_FILE,
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        viewport: { width: 1280, height: 900 },
+    });
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        window.chrome = { runtime: {} };
+    });
+    const page = await context.newPage();
+    const updated = [];
+    try {
+        await page.goto(editUrl, { waitUntil: 'networkidle', timeout: 30000 });
+        if (await page.$('a[href="/login"]')) throw new Error('Session expired — run poshmark_login.js to refresh');
+        await page.waitForSelector('input[data-vv-name="title"]', { timeout: 15000 });
+
+        // Title: real keystrokes update Vuex via the normal Vue event chain
+        if (title !== undefined) {
+            await page.locator('input[data-vv-name="title"]').click({ clickCount: 3 });
+            await page.keyboard.press('Control+a');
+            await page.keyboard.type(title, { delay: 15 });
+            await page.waitForTimeout(200);
+            updated.push('title');
+        }
+
+        // Description: same approach — real keystrokes
+        if (description !== undefined) {
+            await page.locator('textarea[data-vv-name="description"]').click();
+            await page.keyboard.press('Control+a');
+            await page.keyboard.type(description, { delay: 10 });
+            await page.waitForTimeout(200);
+            updated.push('description');
+        }
+
+        // Price: click field → modal opens → type in modal → Done
+        if (price !== undefined) {
+            await page.locator('input[data-vv-name="listingPrice"]').click();
+            const priceModal = page.locator('.listing-price-suggestion-modal');
+            await priceModal.waitFor({ state: 'visible', timeout: 8000 });
+            const modalInput = priceModal.locator('input').first();
+            await modalInput.click({ clickCount: 3 });
+            await page.keyboard.press('Control+a');
+            await page.keyboard.press('Delete');
+            await page.keyboard.type(String(price), { delay: 60 });
+            await page.waitForTimeout(400);
+            await priceModal.locator('button:has-text("Done")').click();
+            await page.waitForTimeout(600);
+            updated.push('price');
+        }
+
+        // Step 1: click Update — Poshmark validates and shows the "Share Listing" screen
+        const updateBtn = page.locator('button:has-text("Update")').last();
+        await updateBtn.scrollIntoViewIfNeeded();
+        await updateBtn.click();
+
+        // Step 2: wait for "List This Item" button and click it — this makes the actual POST
+        const listBtn = page.locator('button:has-text("List This Item")');
+        await listBtn.waitFor({ state: 'visible', timeout: 10000 });
+        await listBtn.click();
+
+        // Wait for navigation to the listing page (confirms save succeeded)
+        await page.waitForURL('**/listing/**', { timeout: 15000 });
+        await context.storageState({ path: SESSION_FILE });
+        return asJsonContent({ ok: true, listingId, editUrl, updated, listingUrl: page.url() });
+    } finally {
+        await browser.close();
+    }
+}
+
+//////////////////////////////
 // poshmark_post_comment
 async function tool_poshmark_post_comment(args) {
     const { listing_url, comment_text } = args;
@@ -4887,7 +4995,7 @@ async function tool_poshmark_post_comment(args) {
     if (!fs.existsSync(SESSION_FILE)) throw new Error('No Poshmark session file — run poshmark_login.js first');
 
     const { chromium } = await import('playwright');
-    const executablePath = resolveChromiumPath();
+    const executablePath = '/opt/supabase-mcp/custom/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell';
 
     const browser = await chromium.launch({
         headless: true,
@@ -4917,7 +5025,7 @@ async function tool_poshmark_post_comment(args) {
         await page.locator('button:has-text("Send")').click();
         await page.waitForTimeout(2000);
         await context.storageState({ path: SESSION_FILE });
-        return { ok: true, listing_url, comment_text };
+        return asJsonContent({ ok: true, listing_url, comment_text });
     } finally {
         await browser.close();
     }
