@@ -569,6 +569,7 @@ If no rows: report "Daily overview not generated yet." Do not attempt to rebuild
 | Verification | `query_table` |
 | Write | `insert_data`, `update_data`, `delete_data`, `upsert_data`, `enforce_mapping` |
 | Notifications | `notify_push` |
+| Poshmark | `poshmark_edit_listing`, `poshmark_post_comment` |
 
 ---
 
@@ -605,6 +606,32 @@ To inspect indexes for any table:
 ```
 
 Read-only, no user approval required, no verification needed.
+
+---
+
+## Poshmark Tools Directive
+
+### `poshmark_edit_listing`
+
+Edits a Poshmark listing's title, description, and/or price using a saved browser session. At least one of `title`, `description`, or `price` must be provided.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `listing_url` | string | ✅ | Full Poshmark listing URL or edit-listing URL |
+| `title` | string | — | New listing title (max 80 chars) |
+| `description` | string | — | New listing description (max 1500 chars) |
+| `price` | number | — | New listing price in USD |
+
+Returns `{ ok: true, updated: [...], listingUrl: "..." }` on success.
+
+### `poshmark_post_comment`
+
+Posts a comment on a Poshmark listing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `listing_url` | string | ✅ | Full Poshmark listing URL |
+| `comment_text` | string | ✅ | Text of the comment to post |
 
 ---
 
