@@ -15,6 +15,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SCORE_THRESHOLD = Number(process.env.WG_SCORE_THRESHOLD || 60);
 const ENABLE_AUTO_MESSAGE = String(process.env.WG_ENABLE_AUTO_MESSAGE || "").toLowerCase() === "true";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+const NACHRICHTEN_URL = "https://www.wg-gesucht.de/nachrichten.html";
 
 function log(msg) { console.log(`[wg_evaluate] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -121,9 +122,35 @@ function hasNoProperBed(listing) {
     return nobed || sofaOnly;
 }
 
+function normalizeUiText(value = "") {
+    return String(value)
+        .toLowerCase()
+        .replace(/[\u2010-\u2015]/g, "-")
+        .replace(/[^\p{L}\p{N}\s-]+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function isPendingSendRetry(listing) {
+    return ENABLE_AUTO_MESSAGE &&
+        !listing.message_sent &&
+        typeof listing.score === "number" &&
+        listing.score >= SCORE_THRESHOLD &&
+        typeof listing.message_text === "string" &&
+        listing.message_text.trim().length > 0;
+}
+
+function isPermanentSendBlockError(error) {
+    const text = String(error?.message ?? error ?? "").toLowerCase();
+    return text.includes("aktuell kann keine nachricht an diesen nutzer") ||
+        text.includes("kann keine nachricht an diesen nutzer") ||
+        text.includes("send blocked by wg/recipient");
+}
+
 function isObviousReject(listing) {
     const today = new Date();
     const moveIn = new Date("2026-06-01");
+    const warm = listing.total_rent ?? (listing.rent + (listing.additional_costs ?? 0));
 
     // Already expired
     if (listing.available_to) {
@@ -145,8 +172,12 @@ function isObviousReject(listing) {
         if (days < 30) return `lease too short (${Math.round(days)} days)`;
     }
 
+    // Tiny studios are an automatic reject regardless of location
+    if (listing.size_m2 && listing.size_m2 < 25) {
+        return `too small (${listing.size_m2}m²)`;
+    }
+
     // Total rent clearly over budget
-    const warm = listing.total_rent ?? (listing.rent + (listing.additional_costs ?? 0));
     if (warm > 820) return `over budget (${warm}€ warm)`;
 
     return null;
@@ -167,8 +198,9 @@ SCORING GUIDE (0–100):
 - Availability: must be available by June 10 2026 (arrival date) — available before = good; after June 10 = already rejected by pre-filter
 - Lease term: unlimited or 6+ months = best; 3–6 months = ok; under 2 months = heavy penalty
 - Anmeldung: explicitly not allowed = heavy penalty (−25); if not mentioned = neutral, do NOT penalize
-- Value: size-to-price ratio — e.g. 40m² at 550€ is great, 30m² at 750€ is poor
-- Location: Gohlis, Connewitz, Plagwitz, Schleußig, Südvorstadt, Zentrum = bonus; outer suburbs = neutral
+- Size: under 25m² is already rejected by pre-filter; 25–30m² should receive a noticeable penalty unless the price is exceptionally low
+- Value: size-to-price ratio is a major factor — e.g. 40m² at 550€ is great, 30m² at 750€ is poor
+- Location: Gohlis, Connewitz, Plagwitz, Schleußig, Südvorstadt, Zentrum = only a small bonus; outer suburbs = neutral
 - Features: balcony, furnished, washing machine = small bonuses
 - Description quality: vague or boilerplate-only = slight penalty
 - "WG geeignet", "2er WG", or "3er WG" on a full apartment listing is only a small penalty, not a rejection
@@ -257,10 +289,13 @@ async function sendMessageOnce(listing, messageText) {
         });
         const page = await context.newPage();
 
-        await page.goto(listing.url, { waitUntil: "domcontentloaded", timeout: 30000 });
+        // Navigate directly to the contact form page (nachricht-senden/<listing-path>)
+        const listingPath = listing.url.replace("https://www.wg-gesucht.de/", "");
+        const contactUrl = `https://www.wg-gesucht.de/nachricht-senden/${listingPath}`;
+        await page.goto(contactUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
         if (/cuba\.html/i.test(page.url())) {
-            throw new Error("Rate limited / captcha detected on listing page");
+            throw new Error("Rate limited / captcha detected");
         }
         if (/login|signin/i.test(page.url())) {
             throw new Error("Session expired — redirected to login");
@@ -269,43 +304,52 @@ async function sendMessageOnce(listing, messageText) {
         // Dismiss cookie banner if present
         try { await page.click("#cmpwelcomebtnyes", { timeout: 3000 }); } catch {}
 
-        // WG-Gesucht renders multiple copies of this button — pick the first visible one
-        const allBtns = page.locator('a:has-text("Nachricht senden"), button:has-text("Nachricht senden")');
-        const btnCount = await allBtns.count();
-        let contactBtn = null;
-        for (let i = 0; i < btnCount; i++) {
-            if (await allBtns.nth(i).isVisible()) { contactBtn = allBtns.nth(i); break; }
-        }
-        if (!contactBtn) throw new Error(`Nachricht senden button not visible (${btnCount} in DOM)`);
-        await contactBtn.click({ timeout: 10000 });
-
-        // Wait for message textarea
-        const msgArea = page.locator([
-            'textarea[name="message_body"]',
-            'textarea[name="message"]',
-            "#message-body",
-            "textarea.contact-form-textarea",
-            "textarea.form-control",
-        ].join(", ")).first();
+        // Fill the message textarea
+        const msgArea = page.locator("textarea").first();
         await msgArea.waitFor({ state: "visible", timeout: 10000 });
         await msgArea.fill(messageText);
 
-        // Submit
-        const submitBtn = page.locator([
-            'button[type="submit"]:has-text("Senden")',
-            'button:has-text("Nachricht absenden")',
-            'button:has-text("Absenden")',
-            'input[type="submit"]',
-        ].join(", ")).first();
-        await submitBtn.click({ timeout: 5000 });
+        // Remove #sec_advice modal via JS — it overlays the submit button on this page too
+        await page.evaluate(() => {
+            const el = document.getElementById("sec_advice");
+            if (el) { el.classList.remove("in"); el.style.display = "none"; }
+            document.querySelectorAll(".modal-backdrop").forEach(b => b.remove());
+            document.body.classList.remove("modal-open");
+        });
+        await page.waitForTimeout(300);
 
-        // Brief settle time then check for visible errors
-        await page.waitForTimeout(3000);
+        // Click the Senden button — force:true as final safety net against any overlay
+        const submitBtn = page.locator('button:has-text("Senden"), input[type="submit"]').first();
+        await submitBtn.waitFor({ state: "visible", timeout: 5000 });
+        await submitBtn.click({ timeout: 5000, force: true });
+
+        await page.waitForTimeout(4000);
+        await page.screenshot({ path: path.join(__dirname, "send_result.png") });
+
+        const finalUrl = page.url();
+        console.log(`[wg_evaluate]   → Post-submit URL: ${finalUrl}`);
 
         const errEl = await page.$(".alert-danger, .has-error");
         if (errEl) {
             const txt = await errEl.textContent();
-            if (txt?.trim()) throw new Error(`Form error: ${txt.trim().slice(0, 200)}`);
+            if (txt?.trim()) {
+                const clean = txt.trim().slice(0, 200);
+                if (clean.toLowerCase().includes("aktuell kann keine nachricht an diesen nutzer")) {
+                    throw new Error(`Send blocked by WG/recipient: ${clean}`);
+                }
+                throw new Error(`Form error: ${clean}`);
+            }
+        }
+
+        // Verify the new conversation is visible in the inbox before we mark this as sent.
+        await page.goto(NACHRICHTEN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.waitForTimeout(3000);
+        await page.screenshot({ path: path.join(__dirname, "send_inbox_check.png") });
+
+        const inboxText = normalizeUiText(await page.locator("body").innerText());
+        const titleProbe = normalizeUiText(listing.title).slice(0, 24);
+        if (!titleProbe || !inboxText.includes(titleProbe)) {
+            throw new Error(`Sent message not confirmed in inbox for title "${listing.title}"`);
         }
     } finally {
         await browser.close();
@@ -386,6 +430,59 @@ async function main() {
                 continue;
             }
 
+            if (isPendingSendRetry(listing)) {
+                log(`  → Retrying previously generated message...`);
+
+                try {
+                    await sendMessage(listing, listing.message_text);
+                    const messageSentAt = new Date().toISOString();
+                    log(`  → Message sent`);
+
+                    await callTool("update_data", {
+                        schema: "finance",
+                        table: "wg_gesucht_listings",
+                        pk: ["listing_id"],
+                        data: [{
+                            listing_id: listing.listing_id,
+                            evaluated: true,
+                            message_sent: true,
+                            message_sent_at: messageSentAt,
+                        }],
+                    });
+
+                    await sleep(4000 + Math.random() * 4000);
+                } catch (sendErr) {
+                    if (isPermanentSendBlockError(sendErr)) {
+                        log(`  → Send permanently blocked: ${sendErr.message}`);
+                        await callTool("update_data", {
+                            schema: "finance",
+                            table: "wg_gesucht_listings",
+                            pk: ["listing_id"],
+                            data: [{
+                                listing_id: listing.listing_id,
+                                evaluated: true,
+                                message_sent: false,
+                                evaluation_notes: `Send blocked by WG/recipient: ${sendErr.message}`,
+                            }],
+                        });
+                    } else {
+                        log(`  → Send failed, will retry next run: ${sendErr.message}`);
+                        await callTool("update_data", {
+                            schema: "finance",
+                            table: "wg_gesucht_listings",
+                            pk: ["listing_id"],
+                            data: [{
+                                listing_id: listing.listing_id,
+                                evaluated: false,
+                                message_sent: false,
+                            }],
+                        });
+                    }
+                }
+
+                continue;
+            }
+
             const evaluation = await evaluateListing(listing, {
                 commercial: isCommercial(listing),
                 noProperBed: hasNoProperBed(listing),
@@ -396,6 +493,8 @@ async function main() {
             let messageText = null;
             let messageSent = false;
             let messageSentAt = null;
+            let shouldStayQueued = false;
+            let sendFailureNote = null;
 
             if (evaluation.score >= SCORE_THRESHOLD) {
                 if (ENABLE_AUTO_MESSAGE) {
@@ -410,6 +509,11 @@ async function main() {
                         await sleep(4000 + Math.random() * 4000);
                     } catch (sendErr) {
                         log(`  → Send failed: ${sendErr.message}`);
+                        if (isPermanentSendBlockError(sendErr)) {
+                            sendFailureNote = `Send blocked by WG/recipient: ${sendErr.message}`;
+                        } else {
+                            shouldStayQueued = true;
+                        }
                     }
                 } else {
                     log(`  → Above threshold, auto-send disabled`);
@@ -422,9 +526,9 @@ async function main() {
                 pk: ["listing_id"],
                 data: [{
                     listing_id: listing.listing_id,
-                    evaluated: true,
+                    evaluated: sendFailureNote ? true : !shouldStayQueued,
                     score: evaluation.score,
-                    evaluation_notes: evaluation.reason,
+                    evaluation_notes: sendFailureNote || evaluation.reason,
                     message_text: messageText,
                     message_sent: messageSent,
                     ...(messageSentAt ? { message_sent_at: messageSentAt } : {}),

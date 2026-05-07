@@ -19,6 +19,20 @@ const NACHRICHTEN_URL = "https://www.wg-gesucht.de/nachrichten.html";
 function log(msg) { console.log(`[wg_messages] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function normalizeTitle(value = "") {
+    return String(value)
+        .toLowerCase()
+        .replace(/[\u2010-\u2015]/g, "-")
+        .replace(/[^\p{L}\p{N}\s-]+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function extractListingIdFromUrl(url = "") {
+    const match = String(url).match(/\.([0-9]{6,})\.html/i);
+    return match ? match[1] : null;
+}
+
 function parseRelativeTime(str) {
     if (!str) return null;
     const s = str.trim();
@@ -63,30 +77,62 @@ async function findListingId(adTitle) {
         schema: "finance",
         table: "wg_gesucht_listings",
         select: "listing_id,title",
-        limit: 200,
+        limit: 500,
     });
     const content = res?.result?.content || res?.content || [];
     const text = content[0]?.text;
     if (!text) return null;
     let parsed; try { parsed = JSON.parse(text); } catch { return null; }
     const rows = parsed.rows ?? parsed.data ?? (Array.isArray(parsed) ? parsed : []);
-    const needle = adTitle.toLowerCase();
-    // Exact substring match first
+    const needle = normalizeTitle(adTitle);
+    // Exact-ish normalized substring match first
     for (const row of rows) {
-        if (row.title && needle.includes(row.title.toLowerCase().slice(0, 20))) return row.listing_id;
-        if (row.title && row.title.toLowerCase().includes(needle.slice(0, 20))) return row.listing_id;
+        if (!row.title) continue;
+        const hay = normalizeTitle(row.title);
+        if (needle === hay) return row.listing_id;
+        if (needle.includes(hay.slice(0, 24))) return row.listing_id;
+        if (hay.includes(needle.slice(0, 24))) return row.listing_id;
     }
     // Word overlap fallback
     const needleWords = needle.split(/\s+/).filter(w => w.length > 4);
     let best = null, bestScore = 0;
     for (const row of rows) {
         if (!row.title) continue;
-        const rowWords = row.title.toLowerCase().split(/\s+/);
+        const rowWords = normalizeTitle(row.title).split(/\s+/);
         const overlap = needleWords.filter(w => rowWords.some(rw => rw.includes(w))).length;
         const score = overlap / Math.max(needleWords.length, 1);
         if (score > bestScore && score >= 0.4) { bestScore = score; best = row.listing_id; }
     }
     return best;
+}
+
+async function backfillConversationListing(thread, listingId) {
+    if (!listingId || !thread?.conversationId) return;
+    try {
+        const existing = await callTool("query_table", {
+            schema: "finance",
+            table: "wg_messages",
+            select: "message_id,listing_id",
+            where: { conversation_id: { op: "eq", value: thread.conversationId } },
+            limit: 100,
+        });
+        const content = existing?.result?.content || existing?.content || [];
+        const text = content[0]?.text;
+        let parsed; try { parsed = JSON.parse(text || "{}"); } catch { parsed = {}; }
+        const rows = parsed.rows ?? parsed.data ?? (Array.isArray(parsed) ? parsed : []);
+        const targets = rows.filter(r => !r.listing_id).map(r => ({ message_id: r.message_id, listing_id: listingId }));
+        if (!targets.length) return;
+
+        await callTool("update_data", {
+            schema: "finance",
+            table: "wg_messages",
+            pk: ["message_id"],
+            data: targets,
+        });
+        log(`  → Backfilled listing_id ${listingId} for ${targets.length} message(s) in conversation ${thread.conversationId}`);
+    } catch (e) {
+        log(`  → Backfill skipped: ${e.message}`);
+    }
 }
 
 async function notify(senderName, preview) {
@@ -143,6 +189,7 @@ async function main() {
             [...document.querySelectorAll(".conversation_list_item:not(.conversation_list_teaser)")].map(el => {
                 const panel = el.querySelector("[data-conversation_id]");
                 const linkEl = el.querySelector("a.link-conversation-list");
+                const adLink = el.querySelector('.conversations_list_ad_title a, a[href*=".html"]');
                 // Strip the #anchor so we load from the top of the conversation
                 const url = linkEl?.href?.replace(/#.*$/, "") || null;
                 return {
@@ -150,6 +197,7 @@ async function main() {
                     url,
                     senderName: el.querySelector(".list_item_public_name")?.textContent?.trim() || "",
                     adTitle: el.querySelector(".conversations_list_ad_title")?.textContent?.trim() || "",
+                    adUrl: adLink?.href?.replace(/#.*$/, "") || null,
                     timeText: el.querySelector("[class*='time'], [class*='date']")?.textContent?.trim() || "",
                 };
             })
@@ -165,11 +213,25 @@ async function main() {
             if (!thread.conversationId || !thread.url) continue;
             log(`[${thread.conversationId}] ${thread.senderName} — "${thread.adTitle.slice(0, 60)}"`);
 
-            const listingId = await findListingId(thread.adTitle);
+            let listingId = extractListingIdFromUrl(thread.adUrl);
+            if (!listingId) listingId = await findListingId(thread.adTitle);
             if (listingId) log(`  listing_id matched: ${listingId}`);
 
             await page.goto(thread.url, { waitUntil: "domcontentloaded", timeout: 20000 });
             await sleep(600);
+
+            if (!listingId) {
+                const threadAdUrl = await page.evaluate(() => {
+                    const link = [...document.querySelectorAll('a[href*=".html"]')]
+                        .find(a => /wg-gesucht\.de\/.+\.html/i.test(a.href) && !/nachrichten\.html/i.test(a.href));
+                    return link?.href?.replace(/#.*$/, "") || null;
+                });
+                listingId = extractListingIdFromUrl(threadAdUrl);
+                if (!listingId) listingId = await findListingId(thread.adTitle);
+                if (listingId) log(`  listing_id resolved from thread: ${listingId}`);
+            }
+
+            await backfillConversationListing(thread, listingId);
 
             // Parse all messages in the conversation
             const messages = await page.evaluate(() =>

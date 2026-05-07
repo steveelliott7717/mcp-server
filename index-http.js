@@ -878,6 +878,7 @@ async function callOneToolByName(name, args) {
     else if (name === 'notify_push') return tool_notify_push(args);
     else if (name === 'poshmark_edit_listing') return tool_poshmark_edit_listing(args);
     else if (name === 'poshmark_post_comment') return tool_poshmark_post_comment(args);
+    else if (name === 'poshmark_get_listing') return tool_poshmark_get_listing(args);
     else if (name === 'browser_flow') return tool_browser_flow(args);
     else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
         return tool_finalize_verification(args);
@@ -1704,6 +1705,7 @@ app.post('/sse', async (req, res) => {
             else if (name === 'notify_push') content = await tool_notify_push(args);
             else if (name === 'poshmark_edit_listing') content = await tool_poshmark_edit_listing(args);
             else if (name === 'poshmark_post_comment') content = await tool_poshmark_post_comment(args);
+            else if (name === 'poshmark_get_listing') content = await tool_poshmark_get_listing(args);
             else if (name === 'browser_flow') content = await tool_browser_flow(args);
             else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
                 content = await tool_finalize_verification(args);
@@ -2442,6 +2444,14 @@ function toolsPayload(){
         comment_text:{ type:'string', description:'Text of the comment to post' },
       },
       required:['listing_url','comment_text']
+    }},
+
+    { name:'poshmark_get_listing', description:'Read the current state of a Poshmark listing (title, description, price, original price, size, brand, condition, category) without making any changes', inputSchema:{
+      type:'object',
+      properties:{
+        listing_url:{ type:'string', description:'Full Poshmark listing URL (or edit-listing URL) — listing ID is extracted automatically' },
+      },
+      required:['listing_url']
     }},
 
     { name:'notify_push', description:'Send a push/notify event (Slack, Pushover, webhook)', inputSchema:{
@@ -4980,6 +4990,85 @@ async function tool_poshmark_edit_listing(args) {
         await page.waitForURL('**/listing/**', { timeout: 15000 });
         await context.storageState({ path: SESSION_FILE });
         return asJsonContent({ ok: true, listingId, editUrl, updated, listingUrl: page.url() });
+    } finally {
+        await browser.close();
+    }
+}
+
+//////////////////////////////
+// poshmark_get_listing
+async function tool_poshmark_get_listing(args) {
+    const { listing_url } = args;
+    if (!listing_url) throw new Error('listing_url is required');
+
+    const idMatch = listing_url.match(/([a-f0-9]{24})(?:[/?#]|$)/i)
+        || listing_url.match(/-([a-zA-Z0-9]{20,})(?:[/?#]|$)/);
+    if (!idMatch) throw new Error('Could not extract listing ID from listing_url');
+    const listingId = idMatch[1];
+    const editUrl = `https://poshmark.com/edit-listing/${listingId}`;
+
+    const SESSION_FILE = '/opt/supabase-mcp/custom/poshmark/session.json';
+    if (!fs.existsSync(SESSION_FILE)) throw new Error('No Poshmark session file — run poshmark_login.js first');
+
+    const { chromium } = await import('playwright');
+    const executablePath = '/opt/supabase-mcp/custom/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell';
+
+    const browser = await chromium.launch({
+        headless: true,
+        executablePath,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+    const context = await browser.newContext({
+        storageState: SESSION_FILE,
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        viewport: { width: 1280, height: 900 },
+    });
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        window.chrome = { runtime: {} };
+    });
+    const page = await context.newPage();
+    try {
+        await page.goto(editUrl, { waitUntil: 'networkidle', timeout: 30000 });
+        if (await page.$('a[href="/login"]')) throw new Error('Session expired — run poshmark_login.js to refresh');
+        await page.waitForSelector('input[data-vv-name="title"]', { timeout: 15000 });
+
+        const listing = await page.evaluate(() => {
+            const val = sel => document.querySelector(sel)?.value?.trim() || null;
+            const txt = sel => document.querySelector(sel)?.textContent?.trim() || null;
+
+            // Price: read from Vuex store via the ListingEditor component
+            let price = null, originalPrice = null;
+            const priceInput = document.querySelector('input[data-vv-name="listingPrice"]');
+            if (priceInput) {
+                price = priceInput.value ? parseFloat(priceInput.value) : null;
+                let el = priceInput;
+                while (el) {
+                    const vm = el.__vue__;
+                    if (vm?.$store) {
+                        const state = vm.$store.state?.['$_listing_editor'];
+                        if (state?.post) {
+                            price = state.post.price_amount ?? price;
+                            originalPrice = state.post.original_price_amount ?? null;
+                        }
+                        break;
+                    }
+                    el = el.parentElement;
+                }
+            }
+
+            return {
+                title: val('input[data-vv-name="title"]'),
+                description: document.querySelector('textarea[data-vv-name="description"]')?.value?.trim() || null,
+                price,
+                originalPrice,
+                size: val('input[data-vv-name="size"]') || txt('[data-vv-name="size"]'),
+                brand: val('input[data-vv-name="brand"]'),
+                condition: txt('.condition-selector .selected') || txt('[data-vv-name="condition"]'),
+            };
+        });
+
+        return asJsonContent({ ok: true, listingId, editUrl, listing });
     } finally {
         await browser.close();
     }

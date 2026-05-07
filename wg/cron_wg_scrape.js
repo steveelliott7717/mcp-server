@@ -16,7 +16,7 @@ const HOME_URL = "https://www.wg-gesucht.de/";
 const SEARCH_URL = "https://www.wg-gesucht.de/1-zimmer-wohnungen-und-wohnungen-in-Leipzig.77.1+2.1.0.html?categories%5B%5D=1&categories%5B%5D=2&rent_types%5B%5D=1&rent_types%5B%5D=2&min_size=30&rent_range=0%2C800&city_id=77&sort_order=0";
 const MAX_PAGES = Number(process.env.WG_MAX_PAGES || 2);
 const START_JITTER_MAX_MS = Number(process.env.WG_SCRAPE_START_JITTER_MS || 180000);
-const MAX_DETAILS_PER_RUN = Number(process.env.WG_SCRAPE_MAX_DETAILS || 5);
+const MAX_DETAILS_PER_RUN = Number(process.env.WG_SCRAPE_MAX_DETAILS || 10);
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -285,6 +285,33 @@ function parseUtilityFeatures(html) {
     return [...new Set(blocks)];
 }
 
+function expandFeatureTokens(features = []) {
+    return [...new Set(
+        features
+            .flatMap(f => String(f).split(","))
+            .map(s => s.replace(/\s+/g, " ").trim())
+            .filter(Boolean)
+    )];
+}
+
+function normalizeAddress(address = "") {
+    let out = String(address)
+        .replace(/\s+/g, " ")
+        .replace(/--+/g, "-")
+        .trim();
+
+    out = out.replace(/\b(\d{1,4})\s+\1\s+(0?\d{4})\b/g, "$1 $2");
+
+    const zipMatch = out.match(/\b(0?\d{4})\b/);
+    if (zipMatch && zipMatch[1].length === 4) {
+        out = out.replace(zipMatch[1], `0${zipMatch[1]}`);
+    }
+
+    out = out.replace(/\bLeip\s+Leipzig\b/i, "Leipzig");
+
+    return out.trim();
+}
+
 function inferRoomsFromListing(card = {}, detail = {}) {
     const source = `${card.url || ""} ${card.title || ""} ${detail.title || ""}`;
     if (/\b1[-\s]?zimmer\b|studio/i.test(source)) return "1";
@@ -329,8 +356,10 @@ function parseDetailHtml(html, card = {}) {
     const panels = parsePanelValues(html);
     const availability = parseAvailability(html);
     const descriptions = parseDescriptions(html);
-    const address = stripTags((html.match(/<[^>]+id=["']mapAddress["'][^>]*>([\s\S]*?)<\/[^>]+>/i) || [])[1] || "") || parseAddress(html);
+    const rawAddress = stripTags((html.match(/<[^>]+id=["']mapAddress["'][^>]*>([\s\S]*?)<\/[^>]+>/i) || [])[1] || "") || parseAddress(html);
+    const address = normalizeAddress(rawAddress);
     const features = parseUtilityFeatures(html);
+    const featureTokens = expandFeatureTokens(features);
     const allDescText = [descriptions.desc_wohnung, descriptions.desc_lage, descriptions.desc_sonstiges, title].filter(Boolean).join(" ");
     // For description text, require a non-negated mention (avoids "kein Balkon", "ohne Keller", etc.)
     const hasPositiveDescMention = (kw) => {
@@ -345,7 +374,8 @@ function parseDetailHtml(html, card = {}) {
         }
         return false;
     };
-    const hasFeature = (kw) => features.some(f => new RegExp(kw, "i").test(f)) || hasPositiveDescMention(kw);
+    const hasFeatureToken = (kw) => featureTokens.some(f => new RegExp(kw, "i").test(f));
+    const hasFeature = (tokenKw, descKw = tokenKw) => hasFeatureToken(tokenKw) || hasPositiveDescMention(descKw);
 
     const district = parseDistrict(html, card.url) || null;
 
@@ -363,15 +393,15 @@ function parseDetailHtml(html, card = {}) {
         available_to_text: panels.available_to_text || availability.available_to_text,
         posted_text: availability.posted_text,
         ...descriptions,
-        features: features.length ? features : null,
-        has_balcony: hasFeature("Balkon|Terrasse|\\bGarten\\b"),
-        has_elevator: hasFeature("Fahrstuhl|Aufzug|Lift"),
-        has_washing_machine: hasFeature("Wasch"),
-        has_dishwasher: hasFeature("Geschirrsp|Spülmaschine|Spuelmaschine"),
-        has_basement: hasFeature("Keller"),
-        has_bathroom: hasFeature("Bad|Dusche"),
-        has_own_kitchen: hasFeature("Küche|Kueche|Kochnische"),
-        furnished: hasFeature("möbliert|moebliert|Möbel"),
+        features: featureTokens.length ? featureTokens : null,
+        has_balcony: hasFeature("(?:^|\\s)(Balkon|Terrasse)(?:$|\\s)", "Balkon|Terrasse"),
+        has_elevator: hasFeature("(?:^|\\s)(Fahrstuhl|Aufzug|Lift)(?:$|\\s)", "Fahrstuhl|Aufzug|Lift"),
+        has_washing_machine: hasFeature("(?:^|\\s)Waschmaschine(?:$|\\s)", "Waschmaschine"),
+        has_dishwasher: hasFeature("(?:^|\\s)(Geschirrsp(?:u|ü)ler|Sp(?:u|ü)lmaschine)(?:$|\\s)", "Geschirrsp(?:u|ü)ler|Sp(?:u|ü)lmaschine"),
+        has_basement: hasFeatureToken("(^|\\s)Keller($|\\s)") || hasPositiveDescMention("\\bKeller\\b"),
+        has_bathroom: hasFeature("(?:^|\\s)(Eigenes Bad|Badewanne|Dusche|Gäste WC)(?:$|\\s)", "Eigenes Bad|Badewanne|Dusche|Gäste WC"),
+        has_own_kitchen: hasFeature("(?:^|\\s)(Eigene Küche|Eigene Kueche|Kochnische)(?:$|\\s)", "Eigene Küche|Eigene Kueche|Kochnische"),
+        furnished: hasFeature("(?:^|\\s)(möbliert|moebliert|teilmöbliert|teilmoebliert)(?:$|\\s)", "möbliert|moebliert|teilmöbliert|teilmoebliert"),
         // Derived from utility_icons labels, with description text fallback
         floor_level: (() => {
             const f = features.find(f => /^(\d+)\.\s*OG$/i.test(f) || /^EG$/i.test(f) || /^DG$/i.test(f));
@@ -415,7 +445,6 @@ async function insertListing(listing_id, url, detail, card = {}) {
         url,
         title: safeDetail.title,
         address: detail.address || null,
-        district: detail.district || null,
         size_m2: parseNum(detail.size_text),
         rooms: parseNum(detail.rooms_text),
         rent: parseNum(detail.costs?.rent),
