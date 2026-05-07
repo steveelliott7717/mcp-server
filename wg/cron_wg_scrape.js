@@ -14,7 +14,7 @@ const SESSION_FILE = path.join(__dirname, "session.json");
 
 const HOME_URL = "https://www.wg-gesucht.de/";
 const SEARCH_URL = "https://www.wg-gesucht.de/1-zimmer-wohnungen-und-wohnungen-in-Leipzig.77.1+2.1.0.html?categories%5B%5D=1&categories%5B%5D=2&rent_types%5B%5D=1&rent_types%5B%5D=2&min_size=30&rent_range=0%2C800&city_id=77&sort_order=0";
-const MAX_PAGES = 1;
+const MAX_PAGES = Number(process.env.WG_MAX_PAGES || 2);
 const START_JITTER_MAX_MS = Number(process.env.WG_SCRAPE_START_JITTER_MS || 180000);
 const MAX_DETAILS_PER_RUN = Number(process.env.WG_SCRAPE_MAX_DETAILS || 5);
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -420,6 +420,15 @@ async function insertListing(listing_id, url, detail, card = {}) {
 
     Object.keys(row).forEach(k => row[k] === null && delete row[k]);
 
+    // Skip listings posted more than 3 days ago
+    if (row.posted_online) {
+        const ageDays = (Date.now() - new Date(row.posted_online).getTime()) / (1000 * 60 * 60 * 24);
+        if (ageDays > 3) {
+            console.log(`[wg_scrape] Skipping ${listing_id} — posted ${Math.round(ageDays)}d ago`);
+            return;
+        }
+    }
+
     const res = await callTool("insert_data", {
         schema: "finance",
         table: "wg_gesucht_listings",
@@ -485,8 +494,8 @@ async function main() {
             break;
         }
 
-        if (newCards.length === 0) {
-            console.log(`[wg_scrape] All listings on page ${pageNum + 1} already known — stopping pagination`);
+        if (newCards.length === 0 && MAX_PAGES === 1) {
+            console.log(`[wg_scrape] All listings on page 1 already known — stopping pagination`);
             break;
         }
     }
