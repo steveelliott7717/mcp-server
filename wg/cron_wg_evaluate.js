@@ -1,10 +1,9 @@
 // /opt/supabase-mcp/custom/wg/cron_wg_evaluate.js
-// Evaluates un-scored WG-Gesucht listings and auto-sends messages above threshold.
+// Evaluates un-scored WG-Gesucht listings and optionally auto-sends messages above threshold.
 
 import dotenv from "dotenv";
 dotenv.config({ path: "/opt/supabase-mcp/custom/.env" });
 
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { callTool } from "./mcp.js";
@@ -14,20 +13,13 @@ const SESSION_FILE = path.join(__dirname, "session.json");
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SCORE_THRESHOLD = Number(process.env.WG_SCORE_THRESHOLD || 60);
+const ENABLE_AUTO_MESSAGE = String(process.env.WG_ENABLE_AUTO_MESSAGE || "").toLowerCase() === "true";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 function log(msg) { console.log(`[wg_evaluate] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function cookieHeader() {
-    const session = JSON.parse(fs.readFileSync(SESSION_FILE, "utf8"));
-    const now = Date.now() / 1000;
-    return (session.cookies || [])
-        .filter(c => /(\.|^)wg-gesucht\.de$/.test(c.domain))
-        .filter(c => !c.expires || c.expires < 0 || c.expires > now)
-        .map(c => `${c.name}=${c.value}`)
-        .join("; ");
-}
+const PLAYWRIGHT_EXECUTABLE = "/opt/supabase-mcp/custom/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell";
 
 async function callOpenAI(messages, jsonMode = false) {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -53,32 +45,56 @@ function isStudentOnly(listing) {
     const text = [
         listing.title,
         listing.description_wohnung,
+        listing.description_lage,
         listing.description_sonstiges,
     ].join(" ").toLowerCase();
 
     return text.includes("immatrikulationsbescheinigung") ||
         text.includes("studentenwohnheim") ||
+        text.includes("studentenwohnanlage") ||
+        text.includes("nur an studenten") ||
+        text.includes("nur fuer studenten") ||
         text.includes("nur für studenten");
 }
 
 function isActuallyWG(listing) {
-    const text = [listing.title, listing.description_wohnung, listing.description_sonstiges]
+    const text = [listing.title, listing.description_wohnung, listing.description_lage, listing.description_sonstiges]
         .join(" ").toLowerCase();
 
-    // Unambiguous single-phrase signals
-    if (text.includes("mitbewohner") || text.includes("mitbewohnerin")) return true;
-    if (text.includes("wg-zimmer") || text.includes("wg-leben") || text.includes("wg-küche")) return true;
-    if (text.includes("wg-bewohner") || text.includes("rest der wg")) return true;
-    if (text.includes("gemeinschaftsküche")) return true;
-    if (text.includes("shared kitchen") || text.includes("room in a shared") || text.includes("room in shared")) return true;
+    const hardWGPatterns = [
+        /\bwg-zimmer\b/i,
+        /\bzimmer in (?:einer |einem |der )?wg\b/i,
+        /\bzimmer frei\b/i,
+        /\bmitbewohner(?:in)?\b/i,
+        /\bwg-leben\b/i,
+        /\bwg-bewohner\b/i,
+        /\brest der wg\b/i,
+        /\bgemeinschaftsküche\b/i,
+        /\bshared kitchen\b/i,
+        /\broom in a shared\b/i,
+        /\broom in shared\b/i,
+        /\bzwischenmiete\b.*\bzimmer\b/i,
+        /\bein möbliertes zimmer steht zur miete\b/i,
+        /\bzimmer steht zur miete\b/i,
+    ];
 
-    // "Wir haben X Zimmer" — almost always the WG introducing their flat
-    if (text.includes("wir haben") && text.includes("zimmer")) return true;
+    return hardWGPatterns.some((pattern) => pattern.test(text));
+}
 
-    // \bwg\b as a standalone word paired with shared-living context words
-    if (/\bwg\b/.test(text) && (text.includes("zimmer") || text.includes("bewohner") || text.includes("küche"))) return true;
+function hasSoftWGSignals(listing) {
+    const text = [listing.title, listing.description_wohnung, listing.description_lage, listing.description_sonstiges]
+        .join(" ")
+        .toLowerCase();
 
-    return false;
+    const softWGPatterns = [
+        /\bwg geeignet\b/i,
+        /\b2er wg\b/i,
+        /\b3er wg\b/i,
+        /\bideal geeignet .* wg\b/i,
+        /\bfür ein paar oder als .*wg\b/i,
+    ];
+
+    return softWGPatterns.some((pattern) => pattern.test(text));
 }
 
 function forbidsAnmeldung(listing) {
@@ -155,8 +171,9 @@ SCORING GUIDE (0–100):
 - Location: Gohlis, Connewitz, Plagwitz, Schleußig, Südvorstadt, Zentrum = bonus; outer suburbs = neutral
 - Features: balcony, furnished, washing machine = small bonuses
 - Description quality: vague or boilerplate-only = slight penalty
+- "WG geeignet", "2er WG", or "3er WG" on a full apartment listing is only a small penalty, not a rejection
 - Commercial listing (GmbH/Immobilien): harder to get, more competitive — apply −10 penalty
-- Sleeping arrangement: no dedicated bed (Schlafsofa only, or explicit "kein Bett") = −8; furnished with a proper Bett mentioned = neutral${flags.commercial ? "\n\nFLAGS:\n- Commercial agency listing detected. Apply the −10 commercial penalty." : ""}${flags.noProperBed ? (flags.commercial ? "\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty." : "\n\nFLAGS:\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty.") : ""}
+- Sleeping arrangement: no dedicated bed (Schlafsofa only, or explicit "kein Bett") = −8; furnished with a proper Bett mentioned = neutral${flags.commercial ? "\n\nFLAGS:\n- Commercial agency listing detected. Apply the −10 commercial penalty." : ""}${flags.noProperBed ? (flags.commercial ? "\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty." : "\n\nFLAGS:\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty.") : ""}${flags.softWG ? ((flags.commercial || flags.noProperBed) ? "\n- Soft WG wording detected ('WG geeignet' / roommate-suitable wording). Treat this as only a small penalty, not a rejection." : "\n\nFLAGS:\n- Soft WG wording detected ('WG geeignet' / roommate-suitable wording). Treat this as only a small penalty, not a rejection.") : ""}
 
 LISTING:
 ${JSON.stringify({
@@ -223,72 +240,74 @@ Output only the completed message text, nothing else.`;
 }
 
 async function sendMessageOnce(listing, messageText) {
-    const COOKIE = cookieHeader();
+    process.env.PLAYWRIGHT_BROWSERS_PATH = "/opt/supabase-mcp/custom/ms-playwright";
+    const { chromium } = await import("playwright");
 
-    // Fetch listing page to get CSRF token and landlord user ID
-    const pageRes = await fetch(listing.url, {
-        headers: {
-            cookie: COOKIE,
-            "user-agent": USER_AGENT,
-            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "accept-language": "de-DE,de;q=0.9,en;q=0.8",
-            referer: "https://www.wg-gesucht.de/",
-        },
+    const browser = await chromium.launch({
+        headless: true,
+        executablePath: PLAYWRIGHT_EXECUTABLE,
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
-
-    if (!pageRes.ok || /cuba\.html/i.test(pageRes.url)) {
-        throw new Error(`Cannot load listing page (${pageRes.status} / ${pageRes.url}) — rate limited or session expired`);
-    }
-
-    const html = await pageRes.text();
-
-    const csrfMatch = html.match(/name=["']?csrf_token["']?[^>]*value=["']([^"']{10,})["']/i)
-        || html.match(/"csrf_token"\s*:\s*"([^"]{10,})"/i);
-    if (!csrfMatch) throw new Error("CSRF token not found on listing page");
-    const csrfToken = csrfMatch[1];
-
-    const userIdMatch = html.match(/user_id\s*[=:]\s*['"]?(\d+)/i)
-        || html.match(/data-user-id=["'](\d+)/i)
-        || html.match(/\/nutzer\/(\d+)/)
-        || html.match(/\/profile\/(\d+)/);
-    if (!userIdMatch) throw new Error("Landlord user ID not found on listing page");
-    const landlordId = userIdMatch[1];
-
-    const adTypeMatch = html.match(/['"](ad_type|anzeigen_typ)['"]\s*[=:]\s*['"]?(\d)/i);
-    const adType = adTypeMatch?.[2] || "1";
-
-    const body = new URLSearchParams({
-        csrf_token: csrfToken,
-        user_id: landlordId,
-        ad_id: listing.listing_id,
-        ad_type: adType,
-        message: messageText,
-        action: "create_contact_offer",
-    });
-
-    const sendRes = await fetch("https://www.wg-gesucht.de/ajax/conversations.php", {
-        method: "POST",
-        headers: {
-            cookie: COOKIE,
-            "user-agent": USER_AGENT,
-            "content-type": "application/x-www-form-urlencoded",
-            referer: listing.url,
-            "x-requested-with": "XMLHttpRequest",
-        },
-        body: body.toString(),
-    });
-
-    const responseText = await sendRes.text();
-    if (!sendRes.ok) throw new Error(`Send failed ${sendRes.status}: ${responseText.slice(0, 300)}`);
 
     try {
-        const json = JSON.parse(responseText);
-        if (json.errors?.length || json.error) {
-            throw new Error(`API error: ${JSON.stringify(json.errors || json.error)}`);
+        const context = await browser.newContext({
+            storageState: SESSION_FILE,
+            userAgent: USER_AGENT,
+            viewport: { width: 1280, height: 900 },
+        });
+        const page = await context.newPage();
+
+        await page.goto(listing.url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+        if (/cuba\.html/i.test(page.url())) {
+            throw new Error("Rate limited / captcha detected on listing page");
         }
-    } catch (e) {
-        if (e.message.startsWith("API error:")) throw e;
-        // Non-JSON 200 OK — treat as success
+        if (/login|signin/i.test(page.url())) {
+            throw new Error("Session expired — redirected to login");
+        }
+
+        // Dismiss cookie banner if present
+        try { await page.click("#cmpwelcomebtnyes", { timeout: 3000 }); } catch {}
+
+        // Click the contact button
+        const contactBtn = page.locator([
+            'a:has-text("Nachricht senden")',
+            'button:has-text("Nachricht senden")',
+            "#contact-button-action",
+            ".contact-button",
+        ].join(", ")).first();
+        await contactBtn.click({ timeout: 10000 });
+
+        // Wait for message textarea
+        const msgArea = page.locator([
+            'textarea[name="message_body"]',
+            'textarea[name="message"]',
+            "#message-body",
+            "textarea.contact-form-textarea",
+            "textarea.form-control",
+        ].join(", ")).first();
+        await msgArea.waitFor({ state: "visible", timeout: 10000 });
+        await msgArea.fill(messageText);
+
+        // Submit
+        const submitBtn = page.locator([
+            'button[type="submit"]:has-text("Senden")',
+            'button:has-text("Nachricht absenden")',
+            'button:has-text("Absenden")',
+            'input[type="submit"]',
+        ].join(", ")).first();
+        await submitBtn.click({ timeout: 5000 });
+
+        // Brief settle time then check for visible errors
+        await page.waitForTimeout(3000);
+
+        const errEl = await page.$(".alert-danger, .has-error");
+        if (errEl) {
+            const txt = await errEl.textContent();
+            if (txt?.trim()) throw new Error(`Form error: ${txt.trim().slice(0, 200)}`);
+        }
+    } finally {
+        await browser.close();
     }
 }
 
@@ -369,6 +388,7 @@ async function main() {
             const evaluation = await evaluateListing(listing, {
                 commercial: isCommercial(listing),
                 noProperBed: hasNoProperBed(listing),
+                softWG: hasSoftWGSignals(listing),
             });
             log(`  score=${evaluation.score} | ${evaluation.reason.slice(0, 100)}`);
 
@@ -377,17 +397,21 @@ async function main() {
             let messageSentAt = null;
 
             if (evaluation.score >= SCORE_THRESHOLD) {
-                log(`  → Above threshold, generating message...`);
-                messageText = await generateMessage(listing, evaluation.highlights ?? "");
+                if (ENABLE_AUTO_MESSAGE) {
+                    log(`  → Above threshold, generating message...`);
+                    messageText = await generateMessage(listing, evaluation.highlights ?? "");
 
-                try {
-                    await sendMessage(listing, messageText);
-                    messageSent = true;
-                    messageSentAt = new Date().toISOString();
-                    log(`  → Message sent`);
-                    await sleep(4000 + Math.random() * 4000);
-                } catch (sendErr) {
-                    log(`  → Send failed: ${sendErr.message}`);
+                    try {
+                        await sendMessage(listing, messageText);
+                        messageSent = true;
+                        messageSentAt = new Date().toISOString();
+                        log(`  → Message sent`);
+                        await sleep(4000 + Math.random() * 4000);
+                    } catch (sendErr) {
+                        log(`  → Send failed: ${sendErr.message}`);
+                    }
+                } else {
+                    log(`  → Above threshold, auto-send disabled`);
                 }
             }
 
