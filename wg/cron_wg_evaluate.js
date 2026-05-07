@@ -64,13 +64,21 @@ function isStudentOnly(listing) {
 function isActuallyWG(listing) {
     const text = [listing.title, listing.description_wohnung, listing.description_sonstiges]
         .join(" ").toLowerCase();
-    return text.includes("mitbewohner") ||
-        text.includes("wg-zimmer") ||
-        text.includes("gemeinschaftsküche") ||
-        text.includes("shared kitchen") ||
-        text.includes("room in a shared") ||
-        text.includes("room in shared") ||
-        text.includes("shared apartment");
+
+    // Unambiguous single-phrase signals
+    if (text.includes("mitbewohner") || text.includes("mitbewohnerin")) return true;
+    if (text.includes("wg-zimmer") || text.includes("wg-leben") || text.includes("wg-küche")) return true;
+    if (text.includes("wg-bewohner") || text.includes("rest der wg")) return true;
+    if (text.includes("gemeinschaftsküche")) return true;
+    if (text.includes("shared kitchen") || text.includes("room in a shared") || text.includes("room in shared")) return true;
+
+    // "Wir haben X Zimmer" — almost always the WG introducing their flat
+    if (text.includes("wir haben") && text.includes("zimmer")) return true;
+
+    // \bwg\b as a standalone word paired with shared-living context words
+    if (/\bwg\b/.test(text) && (text.includes("zimmer") || text.includes("bewohner") || text.includes("küche"))) return true;
+
+    return false;
 }
 
 function forbidsAnmeldung(listing) {
