@@ -89,6 +89,14 @@ function isCommercial(listing) {
         text.includes("vermietung");
 }
 
+function hasNoProperBed(listing) {
+    const text = [listing.title, listing.description_wohnung, listing.description_sonstiges]
+        .join(" ").toLowerCase();
+    const nobed = text.includes("kein bett") || text.includes("ohne bett");
+    const sofaOnly = text.includes("schlafsofa") && !(/\bbett\b/.test(text));
+    return nobed || sofaOnly;
+}
+
 function isObviousReject(listing) {
     const today = new Date();
     const moveIn = new Date("2026-06-01");
@@ -139,7 +147,8 @@ SCORING GUIDE (0–100):
 - Location: Gohlis, Connewitz, Plagwitz, Schleußig, Südvorstadt, Zentrum = bonus; outer suburbs = neutral
 - Features: balcony, furnished, washing machine = small bonuses
 - Description quality: vague or boilerplate-only = slight penalty
-- Commercial listing (GmbH/Immobilien): harder to get, more competitive — apply −10 penalty${flags.commercial ? "\n\nFLAGS: This listing appears to be from a commercial agency (GmbH/Immobilien). Apply the −10 commercial penalty." : ""}
+- Commercial listing (GmbH/Immobilien): harder to get, more competitive — apply −10 penalty
+- Sleeping arrangement: no dedicated bed (Schlafsofa only, or explicit "kein Bett") = −8; furnished with a proper Bett mentioned = neutral${flags.commercial ? "\n\nFLAGS:\n- Commercial agency listing detected. Apply the −10 commercial penalty." : ""}${flags.noProperBed ? (flags.commercial ? "\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty." : "\n\nFLAGS:\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty.") : ""}
 
 LISTING:
 ${JSON.stringify({
@@ -349,7 +358,10 @@ async function main() {
                 continue;
             }
 
-            const evaluation = await evaluateListing(listing, { commercial: isCommercial(listing) });
+            const evaluation = await evaluateListing(listing, {
+                commercial: isCommercial(listing),
+                noProperBed: hasNoProperBed(listing),
+            });
             log(`  score=${evaluation.score} | ${evaluation.reason.slice(0, 100)}`);
 
             let messageText = null;
