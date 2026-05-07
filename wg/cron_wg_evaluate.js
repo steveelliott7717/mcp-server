@@ -244,29 +244,35 @@ Respond with JSON only:
 
 async function generateMessage(listing, highlights) {
     const district = listing.district || "Leipzig";
-    const prompt = `Write a German apartment inquiry message for a WG-Gesucht listing.
+    const styles = [
+        "short and direct — 3 to 5 sentences total, no filler",
+        "conversational — medium length, ask one specific question about the apartment",
+        "warm and personal — mention something concrete from the listing description, vary paragraph structure",
+    ];
+    const style = styles[Math.floor(Math.random() * styles.length)];
+
+    const prompt = `Write a German apartment inquiry message from Steven Elliott to a landlord on WG-Gesucht.
 
 LISTING: "${listing.title}" in ${district}, ${listing.size_m2}m², ${listing.rent}€/month
-STANDOUT FEATURE: ${highlights}
+HIGHLIGHTS: ${highlights}
+STYLE FOR THIS MESSAGE: ${style}
 
-Fill in {PERSONALIZED} in the template below with 1–2 natural German sentences that reference something specific about this listing (the neighborhood, the size, a feature, the price, etc.). Do NOT change any other part of the template.
+REQUIRED FACTS TO INCLUDE (weave them in naturally — do not list them):
+- Steven is moving to Leipzig in June and looking for a few months, ideally longer
+- He has a Sperrkonto (Blocked Account) as financial proof
+- He wants to ask about Anmeldung (Wohnungsgeberbestätigung) if not already obvious from the listing
 
-Hallo,
+RULES:
+- Write the full message, ready to send — start with "Hallo," and end with "Steven Elliott"
+- Use "Viele Grüße", "Beste Grüße", or "Mit freundlichen Grüßen" — vary it
+- Do NOT use the phrase "ruhiger, zuverlässiger Mieter und Nichtraucher" — find a more natural way to convey reliability if needed, or omit it
+- Do NOT use "besonders attraktiv" or other stock filler phrases
+- Reference something specific from the listing — a feature, the neighborhood, the size, the price — not just the district name
+- Vary sentence length and paragraph structure based on the style above
+- Avoid generic emotional filler or imagined lifestyle language ("Es scheint ein schöner Ort zu sein", "perfekt für mich") unless directly supported by something concrete in the listing
+- Sound like a real person, not a template
 
-ich bin sehr interessiert an Ihrer Wohnung in ${district}.
-
-Da ich im Juni nach Leipzig ziehe, suche ich eine Wohnung für mehrere Monate (gerne auch länger). {PERSONALIZED}
-
-Ich verfüge über ein Sperrkonto (Blocked Account) als gesicherte finanzielle Grundlage und kann entsprechende Nachweise gerne vorlegen. Ich bin ein ruhiger, zuverlässiger Mieter und Nichtraucher.
-
-Ist eine Anmeldung (Wohnungsgeberbestätigung) möglich?
-
-Gerne würde ich eine Besichtigung vereinbaren – auch online.
-
-Viele Grüße
-Steven Elliott
-
-Output only the completed message text, nothing else.`;
+Output only the message text, nothing else.`;
 
     return await callOpenAI([{ role: "user", content: prompt }]);
 }
