@@ -89,12 +89,20 @@ async function findListingId(adTitle) {
     return best;
 }
 
-async function notify(senderName, preview, conversationId) {
+async function notify(senderName, preview) {
+    const apiToken = process.env.PUSHOVER_TOKEN_WG || process.env.PUSHOVER_API_TOKEN;
+    const userKey  = process.env.PUSHOVER_USER_KEY;
+    if (!apiToken || !userKey) {
+        log("  → Push skipped: PUSHOVER_TOKEN_WG / PUSHOVER_USER_KEY not set");
+        return;
+    }
     try {
         await callTool("notify_push", {
-            title: `WG reply from ${senderName}`,
+            provider: "pushover",
+            api_token: apiToken,
+            user_key: userKey,
+            title: `WG reply: ${senderName}`,
             body: preview.slice(0, 200),
-            level: "info",
         });
         log(`  → Push notification sent`);
     } catch (e) {
@@ -208,7 +216,7 @@ async function main() {
 
                     if (direction === "received") {
                         newReceived++;
-                        await notify(thread.senderName, msg.body, thread.conversationId);
+                        await notify(thread.senderName, msg.body);
                         // Mark notified
                         await callTool("update_data", {
                             schema: "finance",
