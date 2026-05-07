@@ -68,7 +68,8 @@ function isActuallyWG(listing) {
         text.includes("wg-zimmer") ||
         text.includes("gemeinschaftsküche") ||
         text.includes("shared kitchen") ||
-        text.includes("room in") ||
+        text.includes("room in a shared") ||
+        text.includes("room in shared") ||
         text.includes("shared apartment");
 }
 

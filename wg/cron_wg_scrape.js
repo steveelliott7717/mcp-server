@@ -240,6 +240,30 @@ function parseAddress(html) {
         .trim();
 }
 
+function parseDistrict(html, url) {
+    const CITY_RE = /^Leipzig$/i;
+    const DC = "[A-ZÄÖÜa-zäöüß][A-ZÄÖÜa-zäöüß\\-]+";
+
+    // Try URL: wohnungen-in-Leipzig-{District}.{id}.html
+    const urlMatch = url?.match(/wohnungen-in-[^-]+-([A-Za-zÄÖÜäöüß\-]+)\.\d+\.html/i);
+    if (urlMatch && !CITY_RE.test(urlMatch[1])) {
+        return urlMatch[1].replace(/-/g, " ");
+    }
+
+    // Try breadcrumb: "Wohnungen in {District}" — last non-city match is most specific
+    const crumbs = [...html.matchAll(new RegExp(`Wohnungen\\s+in\\s+(${DC}(?:\\s+${DC})*)(?:\\s*<|\\s*»)`, "gi"))];
+    for (let i = crumbs.length - 1; i >= 0; i--) {
+        const c = crumbs[i][1].trim();
+        if (!CITY_RE.test(c)) return c;
+    }
+
+    // Try "ZIP Leipzig / District" or "Leipzig-District" in body text
+    const locMatch = html.match(new RegExp(`\\b0\\d{4}\\s+Leipzig\\s*[\\/\\-]\\s*(${DC})`, "i"));
+    if (locMatch && !CITY_RE.test(locMatch[1])) return locMatch[1];
+
+    return null;
+}
+
 function parseAvailability(html) {
     const text = stripTags(html);
     return {
@@ -323,11 +347,14 @@ function parseDetailHtml(html, card = {}) {
     };
     const hasFeature = (kw) => features.some(f => new RegExp(kw, "i").test(f)) || hasPositiveDescMention(kw);
 
+    const district = parseDistrict(html, card.url) || null;
+
     return {
         title,
         page_title,
         body_text,
         address,
+        district,
         size_text: facts.size_text || "",
         rooms_text: facts.rooms_text || inferRoomsFromListing(card, { title }),
         rent_summary: facts.rent_summary || "",
@@ -337,7 +364,7 @@ function parseDetailHtml(html, card = {}) {
         posted_text: availability.posted_text,
         ...descriptions,
         features: features.length ? features : null,
-        has_balcony: hasFeature("Balkon|Terrasse|Garten"),
+        has_balcony: hasFeature("Balkon|Terrasse|\\bGarten\\b"),
         has_elevator: hasFeature("Fahrstuhl|Aufzug|Lift"),
         has_washing_machine: hasFeature("Wasch"),
         has_dishwasher: hasFeature("Geschirrsp|Spülmaschine|Spuelmaschine"),
@@ -388,6 +415,7 @@ async function insertListing(listing_id, url, detail, card = {}) {
         url,
         title: safeDetail.title,
         address: detail.address || null,
+        district: detail.district || null,
         size_m2: parseNum(detail.size_text),
         rooms: parseNum(detail.rooms_text),
         rent: parseNum(detail.costs?.rent),
