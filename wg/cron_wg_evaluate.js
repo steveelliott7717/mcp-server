@@ -13,7 +13,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_FILE = path.join(__dirname, "session.json");
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const SCORE_THRESHOLD = Number(process.env.WG_SCORE_THRESHOLD || 65);
+const SCORE_THRESHOLD = Number(process.env.WG_SCORE_THRESHOLD || 60);
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 function log(msg) { console.log(`[wg_evaluate] ${msg}`); }
@@ -64,11 +64,12 @@ function isStudentOnly(listing) {
 function isActuallyWG(listing) {
     const text = [listing.title, listing.description_wohnung, listing.description_sonstiges]
         .join(" ").toLowerCase();
-    return text.includes("wg") ||
-        text.includes("mitbewohner") ||
+    return text.includes("mitbewohner") ||
+        text.includes("wg-zimmer") ||
         text.includes("gemeinschaftsküche") ||
         text.includes("shared kitchen") ||
-        text.includes("room in");
+        text.includes("room in") ||
+        text.includes("shared apartment");
 }
 
 function forbidsAnmeldung(listing) {
@@ -132,7 +133,7 @@ TENANT PROFILE:
 SCORING GUIDE (0–100):
 - Availability: must be available by June 10 2026 (arrival date) — available before = good; after June 10 = already rejected by pre-filter
 - Lease term: unlimited or 6+ months = best; 3–6 months = ok; under 2 months = heavy penalty
-- Anmeldung: explicitly not allowed = heavy penalty (−25)
+- Anmeldung: explicitly not allowed = heavy penalty (−25); if not mentioned = neutral, do NOT penalize
 - Value: size-to-price ratio — e.g. 40m² at 550€ is great, 30m² at 750€ is poor
 - Location: Gohlis, Connewitz, Plagwitz, Schleußig, Südvorstadt, Zentrum = bonus; outer suburbs = neutral
 - Features: balcony, furnished, washing machine = small bonuses
@@ -228,7 +229,8 @@ async function sendMessageOnce(listing, messageText) {
     if (!csrfMatch) throw new Error("CSRF token not found on listing page");
     const csrfToken = csrfMatch[1];
 
-    const userIdMatch = html.match(/["']user_id["']\s*[=:]\s*["']?(\d+)/i)
+    const userIdMatch = html.match(/user_id\s*[=:]\s*['"]?(\d+)/i)
+        || html.match(/data-user-id=["'](\d+)/i)
         || html.match(/\/nutzer\/(\d+)/)
         || html.match(/\/profile\/(\d+)/);
     if (!userIdMatch) throw new Error("Landlord user ID not found on listing page");
@@ -303,7 +305,9 @@ async function main() {
         limit: 30,
     });
 
-    const rows = result?.parsed?.data ?? result?.data ?? [];
+    const text = result?.result?.content?.[0]?.text || result?.content?.[0]?.text || "{}";
+    let parsed; try { parsed = JSON.parse(text); } catch { parsed = {}; }
+    const rows = parsed?.rows ?? [];
     if (!rows.length) {
         log("No un-evaluated listings");
         return;

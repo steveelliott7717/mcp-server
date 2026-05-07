@@ -397,7 +397,6 @@ async function insertListing(listing_id, url, detail, card = {}) {
         total_rent: parseNum(detail.costs?.total || detail.rent_summary),
         available_from: parseDate(detail.available_text),
         available_to: parseDate(detail.available_to_text),
-        posted_online: parseDate(detail.posted_text),
         description_wohnung: detail.desc_wohnung,
         description_lage: detail.desc_lage,
         description_sonstiges: detail.desc_sonstiges,
@@ -420,9 +419,10 @@ async function insertListing(listing_id, url, detail, card = {}) {
 
     Object.keys(row).forEach(k => row[k] === null && delete row[k]);
 
-    // Skip listings posted more than 3 days ago
-    if (row.posted_online) {
-        const ageDays = (Date.now() - new Date(row.posted_online).getTime()) / (1000 * 60 * 60 * 24);
+    // Skip listings posted more than 3 days ago (parsed but not stored)
+    const postedDate = parseDate(detail.posted_text);
+    if (postedDate) {
+        const ageDays = (Date.now() - new Date(postedDate).getTime()) / (1000 * 60 * 60 * 24);
         if (ageDays > 3) {
             console.log(`[wg_scrape] Skipping ${listing_id} — posted ${Math.round(ageDays)}d ago`);
             return;
