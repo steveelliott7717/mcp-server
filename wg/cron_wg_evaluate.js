@@ -269,13 +269,14 @@ async function sendMessageOnce(listing, messageText) {
         // Dismiss cookie banner if present
         try { await page.click("#cmpwelcomebtnyes", { timeout: 3000 }); } catch {}
 
-        // Click the contact button
-        const contactBtn = page.locator([
-            'a:has-text("Nachricht senden")',
-            'button:has-text("Nachricht senden")',
-            "#contact-button-action",
-            ".contact-button",
-        ].join(", ")).first();
+        // WG-Gesucht renders multiple copies of this button — pick the first visible one
+        const allBtns = page.locator('a:has-text("Nachricht senden"), button:has-text("Nachricht senden")');
+        const btnCount = await allBtns.count();
+        let contactBtn = null;
+        for (let i = 0; i < btnCount; i++) {
+            if (await allBtns.nth(i).isVisible()) { contactBtn = allBtns.nth(i); break; }
+        }
+        if (!contactBtn) throw new Error(`Nachricht senden button not visible (${btnCount} in DOM)`);
         await contactBtn.click({ timeout: 10000 });
 
         // Wait for message textarea
