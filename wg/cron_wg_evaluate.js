@@ -200,8 +200,8 @@ SCORING GUIDE (0–100):
 - Anmeldung: explicitly not allowed = heavy penalty (−25); if not mentioned = neutral, do NOT penalize
 - Size: under 25m² is already rejected by pre-filter; 25–30m² should receive a noticeable penalty unless the price is exceptionally low
 - Value: size-to-price ratio is a major factor — e.g. 40m² at 550€ is great, 30m² at 750€ is poor
-- Location: Gohlis, Connewitz, Plagwitz, Schleußig, Südvorstadt, Zentrum = only a small bonus; outer suburbs = neutral
-- Features: balcony, furnished, washing machine = small bonuses
+- Location: central or well-connected neighborhoods get a small bonus, including Zentrum, Zentrum-Süd, Zentrum-Ost, Zentrum-West, Zentrum-Nord, Südvorstadt, Reudnitz, Volkmarsdorf, Neustadt-Neuschönefeld, Connewitz, and Plagwitz. Do not penalize grittier but central neighborhoods if transit access is good; outer suburbs = neutral
+- Features: furnished, washing machine = small bonuses
 - Description quality: vague or boilerplate-only = slight penalty
 - "WG geeignet", "2er WG", or "3er WG" on a full apartment listing is only a small penalty, not a rejection
 - Commercial listing (GmbH/Immobilien): harder to get, more competitive — apply −10 penalty
