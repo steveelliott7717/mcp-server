@@ -22,6 +22,37 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 const PLAYWRIGHT_EXECUTABLE = "/opt/supabase-mcp/custom/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell";
 
+function parseToolRows(res) {
+    const content = res?.result?.content || res?.content || [];
+    const text = content[0]?.text;
+    if (!text) return [];
+    let parsed; try { parsed = JSON.parse(text); } catch { return []; }
+    return parsed.rows ?? parsed.data ?? (Array.isArray(parsed) ? parsed : []);
+}
+
+function extractStreet(address = "") {
+    const m = address.match(/^(.+?)\s+\d{4,5}/);
+    return m ? m[1].trim() : null;
+}
+
+async function hasSentToContact(contactName, address) {
+    if (!contactName) return false;
+    const street = extractStreet(address || "");
+    const where = {
+        contact_name: { op: "ilike", value: contactName },
+        message_sent: { op: "eq", value: true },
+    };
+    if (street) where.address = { op: "ilike", value: `%${street}%` };
+    const res = await callTool("query_table", {
+        schema: "finance",
+        table: "wg_gesucht_listings",
+        select: "listing_id",
+        where,
+        limit: 1,
+    });
+    return parseToolRows(res).length > 0;
+}
+
 async function callOpenAI(messages, jsonMode = false) {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -122,9 +153,56 @@ function hasNoProperBed(listing) {
     return nobed || sofaOnly;
 }
 
+function hasFurnitureTakeover(listing) {
+    const text = normalizeUiText([
+        listing.title,
+        listing.description_wohnung,
+        listing.description_lage,
+        listing.description_sonstiges,
+        ...(Array.isArray(listing.features) ? listing.features : []),
+    ].join(" "));
+
+    const patterns = [
+        /\bmoebeluebernahme\b/,
+        /\bmoebel uebernahme\b/,
+        /\bmoebel.*uebernommen\b/,
+        /\bmoebel.*uebernehmen\b/,
+        /\bkueche.*uebernommen\b/,
+        /\bkueche.*uebernehmen\b/,
+        /\bablose\b/,
+        /\babstandszahlung\b/,
+        /\beinrichtung.*uebernehmen\b/,
+        /\bgegenstaende.*uebernehmen\b/,
+    ];
+
+    return patterns.some((pattern) => pattern.test(text));
+}
+
+function hasMandatoryFurnitureTakeover(listing) {
+    const text = normalizeUiText([
+        listing.description_wohnung,
+        listing.description_sonstiges,
+    ].join(" "));
+
+    return /pflicht\s*(zur\s*)?uebernahme|muss\s*uebernommen|ist\s*zu\s*uebernehmen|pflichtuebernahme|verpflichtend.*uebernehmen|uebernahme.*pflicht/.test(text);
+}
+
+function parseFurnitureCost(listing) {
+    const text = [listing.description_wohnung || "", listing.description_sonstiges || ""].join(" ");
+    const matches = [...text.matchAll(/(\d[\d.,]+)\s*[€.]/g)];
+    const values = matches
+        .map(m => parseFloat(m[1].replace(/\./g, "").replace(",", ".")))
+        .filter(v => v >= 200 && v <= 15000);
+    return values.length ? Math.max(...values) : null;
+}
+
 function normalizeUiText(value = "") {
     return String(value)
         .toLowerCase()
+        .replace(/ä/g, "ae")
+        .replace(/ö/g, "oe")
+        .replace(/ü/g, "ue")
+        .replace(/ß/g, "ss")
         .replace(/[\u2010-\u2015]/g, "-")
         .replace(/[^\p{L}\p{N}\s-]+/gu, " ")
         .replace(/\s+/g, " ")
@@ -180,6 +258,12 @@ function isObviousReject(listing) {
     // Total rent clearly over budget
     if (warm > 820) return `over budget (${warm}€ warm)`;
 
+    // Mandatory furniture takeover with a stated cost over 1000€
+    if (hasMandatoryFurnitureTakeover(listing)) {
+        const cost = parseFurnitureCost(listing);
+        if (cost && cost > 1000) return `mandatory furniture takeover (${cost}€)`;
+    }
+
     return null;
 }
 
@@ -202,10 +286,11 @@ SCORING GUIDE (0–100):
 - Value: size-to-price ratio is a major factor — e.g. 40m² at 550€ is great, 30m² at 750€ is poor
 - Location: central or well-connected neighborhoods get a small bonus, including Zentrum, Zentrum-Süd, Zentrum-Ost, Zentrum-West, Zentrum-Nord, Südvorstadt, Reudnitz, Volkmarsdorf, Neustadt-Neuschönefeld, Connewitz, and Plagwitz. Do not penalize grittier but central neighborhoods if transit access is good; outer suburbs = neutral
 - Features: furnished, washing machine = small bonuses
+- Furniture takeover: distinguish carefully — optional takeover (nice extras at negotiable price) is a small positive; MANDATORY takeover (Pflicht zur Übernahme, muss übernommen werden) is an additional upfront cost to the tenant, treat it as a moderate negative unless the items are genuinely essential (bed, kitchen) and no large fee is mentioned
 - Description quality: vague or boilerplate-only = slight penalty
 - "WG geeignet", "2er WG", or "3er WG" on a full apartment listing is only a small penalty, not a rejection
 - Commercial listing (GmbH/Immobilien): harder to get, more competitive — apply −10 penalty
-- Sleeping arrangement: no dedicated bed (Schlafsofa only, or explicit "kein Bett") = −8; furnished with a proper Bett mentioned = neutral${flags.commercial ? "\n\nFLAGS:\n- Commercial agency listing detected. Apply the −10 commercial penalty." : ""}${flags.noProperBed ? (flags.commercial ? "\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty." : "\n\nFLAGS:\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty.") : ""}${flags.softWG ? ((flags.commercial || flags.noProperBed) ? "\n- Soft WG wording detected ('WG geeignet' / roommate-suitable wording). Treat this as only a small penalty, not a rejection." : "\n\nFLAGS:\n- Soft WG wording detected ('WG geeignet' / roommate-suitable wording). Treat this as only a small penalty, not a rejection.") : ""}
+- Sleeping arrangement: no dedicated bed (Schlafsofa only, or explicit "kein Bett") = −8; furnished with a proper Bett mentioned = neutral${flags.commercial ? "\n\nFLAGS:\n- Commercial agency listing detected. Apply the −10 commercial penalty." : ""}${flags.noProperBed ? (flags.commercial ? "\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty." : "\n\nFLAGS:\n- No proper bed detected (Schlafsofa only or explicit 'kein Bett'). Apply the −8 sleeping arrangement penalty.") : ""}${flags.softWG ? ((flags.commercial || flags.noProperBed) ? "\n- Soft WG wording detected ('WG geeignet' / roommate-suitable wording). Treat this as only a small penalty, not a rejection." : "\n\nFLAGS:\n- Soft WG wording detected ('WG geeignet' / roommate-suitable wording). Treat this as only a small penalty, not a rejection.") : ""}${flags.mandatoryFurnitureTakeover ? ((flags.commercial || flags.noProperBed || flags.softWG) ? `\n- MANDATORY furniture/kitchen takeover detected (Pflicht zur Übernahme). This is an additional upfront cost for the tenant — apply a moderate penalty. Do not treat as a furnished bonus.${flags.furnitureCost ? ` Stated cost: ${flags.furnitureCost}€.` : ""}` : `\n\nFLAGS:\n- MANDATORY furniture/kitchen takeover detected (Pflicht zur Übernahme). This is an additional upfront cost for the tenant — apply a moderate penalty. Do not treat as a furnished bonus.${flags.furnitureCost ? ` Stated cost: ${flags.furnitureCost}€.` : ""}`) : flags.furnitureTakeover ? ((flags.commercial || flags.noProperBed || flags.softWG) ? "\n- Optional furniture/kitchen takeover wording detected. Treat the listing as partially furnished / move-in-friendly even if the structured furnished field is false." : "\n\nFLAGS:\n- Optional furniture/kitchen takeover wording detected. Treat the listing as partially furnished / move-in-friendly even if the structured furnished field is false.") : ""}
 
 LISTING:
 ${JSON.stringify({
@@ -424,6 +509,17 @@ async function main() {
                 continue;
             }
 
+            if (listing.contact_name && await hasSentToContact(listing.contact_name, listing.address)) {
+                log(`  → Skipped: already contacted ${listing.contact_name}`);
+                await callTool("update_data", {
+                    schema: "finance",
+                    table: "wg_gesucht_listings",
+                    pk: ["listing_id"],
+                    data: [{ listing_id: listing.listing_id, evaluated: true, score: 0, evaluation_notes: `Skipped: already contacted ${listing.contact_name}` }],
+                });
+                continue;
+            }
+
             const rejectReason = isObviousReject(listing);
             if (rejectReason) {
                 log(`  → Skipped (${rejectReason})`);
@@ -489,10 +585,14 @@ async function main() {
                 continue;
             }
 
+            const mandatoryFurniture = hasMandatoryFurnitureTakeover(listing);
             const evaluation = await evaluateListing(listing, {
                 commercial: isCommercial(listing),
                 noProperBed: hasNoProperBed(listing),
                 softWG: hasSoftWGSignals(listing),
+                furnitureTakeover: hasFurnitureTakeover(listing),
+                mandatoryFurnitureTakeover: mandatoryFurniture,
+                furnitureCost: mandatoryFurniture ? parseFurnitureCost(listing) : null,
             });
             log(`  score=${evaluation.score} | ${evaluation.reason.slice(0, 100)}`);
 

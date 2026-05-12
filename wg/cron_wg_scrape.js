@@ -329,6 +329,17 @@ function sectionBetween(html, id, nextIds = []) {
     return stripTags(html.slice(start, end));
 }
 
+function parseContactName(html) {
+    const start = html.search(/class=["'][^"']*rhs_contact_information[^"']*["']/i);
+    if (start < 0) return null;
+    const chunk = html.slice(start, start + 2000);
+    const m = chunk.match(/<p[^>]*class=["'][^"']*\bmb0\b[^"']*["'][^>]*>([\s\S]*?)<\/p>/i);
+    if (!m) return null;
+    const name = stripTags(m[1]).trim();
+    if (!name || name.length < 2 || name.length > 60 || /mitglied|online|offline|\d{4}/i.test(name)) return null;
+    return name;
+}
+
 function parseDescriptions(html) {
     // freitext_3 can bleed into the required-docs / upsell panel — stop at known anchors
     const sonstigesStops = ["freitext_4", "rhs-contact-information", "utilities_rhs", "note_saved_feedback"];
@@ -394,6 +405,7 @@ function parseDetailHtml(html, card = {}) {
         posted_text: availability.posted_text,
         ...descriptions,
         features: featureTokens.length ? featureTokens : null,
+        contact_name: parseContactName(html),
         has_balcony: hasFeature("(?:^|\\s)(Balkon|Terrasse)(?:$|\\s)", "Balkon|Terrasse"),
         has_elevator: hasFeature("(?:^|\\s)(Fahrstuhl|Aufzug|Lift)(?:$|\\s)", "Fahrstuhl|Aufzug|Lift"),
         has_washing_machine: hasFeature("(?:^|\\s)Waschmaschine(?:$|\\s)", "Waschmaschine"),
@@ -470,6 +482,7 @@ async function insertListing(listing_id, url, detail, card = {}) {
         building_type: detail.building_type || null,
         floor_type: detail.floor_type || null,
         minutes_on_foot: detail.minutes_on_foot,
+        contact_name: detail.contact_name || null,
         evaluated: false,
         message_sent: false,
     };

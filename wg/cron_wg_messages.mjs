@@ -71,39 +71,79 @@ async function getExistingMessageIds() {
     return new Set(rows.map(r => r.message_id));
 }
 
-async function findListingId(adTitle) {
-    if (!adTitle) return null;
+const GENERIC_TITLE_RE = /^(\d-?zimmer-?wohnung|wohnung|apartment|studio|zimmer|1-zimmer-wohnung|2-zimmer-wohnung|3-zimmer-wohnung)$/i;
+
+async function fetchListingCandidates() {
     const res = await callTool("query_table", {
         schema: "finance",
         table: "wg_gesucht_listings",
-        select: "listing_id,title",
+        select: "listing_id,title,district,message_sent,message_sent_at",
         limit: 500,
     });
     const content = res?.result?.content || res?.content || [];
     const text = content[0]?.text;
-    if (!text) return null;
-    let parsed; try { parsed = JSON.parse(text); } catch { return null; }
-    const rows = parsed.rows ?? parsed.data ?? (Array.isArray(parsed) ? parsed : []);
+    if (!text) return [];
+    let parsed; try { parsed = JSON.parse(text); } catch { return []; }
+    return parsed.rows ?? parsed.data ?? (Array.isArray(parsed) ? parsed : []);
+}
+
+function resolveListingId(adTitle, adUrl, approxTime, candidates) {
+    // 1. Exact listing ID extracted from URL — most reliable
+    const urlId = extractListingIdFromUrl(adUrl);
+    if (urlId) return { listingId: urlId, source: "url-id" };
+
+    if (!adTitle || !candidates.length) return { listingId: null, source: null };
+
     const needle = normalizeTitle(adTitle);
-    // Exact-ish normalized substring match first
-    for (const row of rows) {
-        if (!row.title) continue;
-        const hay = normalizeTitle(row.title);
-        if (needle === hay) return row.listing_id;
-        if (needle.includes(hay.slice(0, 24))) return row.listing_id;
-        if (hay.includes(needle.slice(0, 24))) return row.listing_id;
-    }
-    // Word overlap fallback
     const needleWords = needle.split(/\s+/).filter(w => w.length > 4);
-    let best = null, bestScore = 0;
-    for (const row of rows) {
-        if (!row.title) continue;
-        const rowWords = normalizeTitle(row.title).split(/\s+/);
-        const overlap = needleWords.filter(w => rowWords.some(rw => rw.includes(w))).length;
-        const score = overlap / Math.max(needleWords.length, 1);
-        if (score > bestScore && score >= 0.4) { bestScore = score; best = row.listing_id; }
+
+    const scored = candidates.map(row => {
+        if (!row.title) return null;
+        const hay = normalizeTitle(row.title);
+        let score = 0;
+        let source = "";
+
+        if (needle === hay) {
+            score = 100; source = "exact-title";
+        } else if (needle.length > 20 && (needle.includes(hay.slice(0, 24)) || hay.includes(needle.slice(0, 24)))) {
+            score = 60; source = "substring-title";
+        } else if (needleWords.length > 0) {
+            const hayWords = hay.split(/\s+/);
+            const overlap = needleWords.filter(w => hayWords.some(hw => hw.includes(w))).length;
+            const ratio = overlap / needleWords.length;
+            if (ratio >= 0.4) { score = Math.round(ratio * 50); source = "word-overlap"; }
+        }
+
+        if (score === 0) return null;
+
+        // Prefer listings where a message was actually sent
+        if (row.message_sent) score += 20;
+
+        // Prefer listings whose sent time is close to the thread's approximate time
+        if (approxTime && row.message_sent_at) {
+            const diffH = Math.abs(new Date(approxTime) - new Date(row.message_sent_at)) / 3600000;
+            if (diffH < 1) score += 30;
+            else if (diffH < 6) score += 15;
+            else if (diffH < 24) score += 5;
+        }
+
+        return { listing_id: row.listing_id, title: row.title, score, source };
+    }).filter(Boolean).sort((a, b) => b.score - a.score);
+
+    if (!scored.length) return { listingId: null, source: null };
+
+    const best = scored[0];
+
+    // Refuse to guess when title is generic and runner-up is close in score
+    if (scored.length > 1 && scored[1].score >= best.score - 10) {
+        const norm = normalizeTitle(best.title).replace(/\s+/g, "-");
+        if (GENERIC_TITLE_RE.test(norm)) {
+            log(`  listing_id ambiguous for "${adTitle}" — leaving null`);
+            return { listingId: null, source: "ambiguous" };
+        }
     }
-    return best;
+
+    return { listingId: best.listing_id, source: `${best.source}(score=${best.score})` };
 }
 
 async function backfillConversationListing(thread, listingId) {
@@ -189,7 +229,7 @@ async function main() {
             [...document.querySelectorAll(".conversation_list_item:not(.conversation_list_teaser)")].map(el => {
                 const panel = el.querySelector("[data-conversation_id]");
                 const linkEl = el.querySelector("a.link-conversation-list");
-                const adLink = el.querySelector('.conversations_list_ad_title a, a[href*=".html"]');
+                const adLink = el.querySelector('.conversations_list_ad_title a[href*=".html"]');
                 // Strip the #anchor so we load from the top of the conversation
                 const url = linkEl?.href?.replace(/#.*$/, "") || null;
                 return {
@@ -206,6 +246,9 @@ async function main() {
         log(`Found ${threads.length} conversation(s)`);
         if (!threads.length) { log("Nothing to process"); return; }
 
+        const listingCandidates = await fetchListingCandidates();
+        log(`Loaded ${listingCandidates.length} listing candidates for matching`);
+
         let newReceived = 0;
 
         // ── 2. Process each conversation ──────────────────────────────
@@ -213,22 +256,27 @@ async function main() {
             if (!thread.conversationId || !thread.url) continue;
             log(`[${thread.conversationId}] ${thread.senderName} — "${thread.adTitle.slice(0, 60)}"`);
 
-            let listingId = extractListingIdFromUrl(thread.adUrl);
-            if (!listingId) listingId = await findListingId(thread.adTitle);
-            if (listingId) log(`  listing_id matched: ${listingId}`);
+            const approxTime = parseRelativeTime(thread.timeText);
+            let { listingId, source } = resolveListingId(thread.adTitle, thread.adUrl, approxTime, listingCandidates);
+            if (listingId) log(`  listing_id matched: ${listingId} via ${source}`);
 
             await page.goto(thread.url, { waitUntil: "domcontentloaded", timeout: 20000 });
             await sleep(600);
 
             if (!listingId) {
                 const threadAdUrl = await page.evaluate(() => {
+                    const adArea = document.querySelector('.conversation_ad_title, [class*="conversation_ad"], .panel-heading');
+                    if (adArea) {
+                        const link = adArea.querySelector('a[href*=".html"]');
+                        if (link && /\.\d{6,}\.html/i.test(link.href)) return link.href.replace(/#.*$/, "");
+                    }
                     const link = [...document.querySelectorAll('a[href*=".html"]')]
-                        .find(a => /wg-gesucht\.de\/.+\.html/i.test(a.href) && !/nachrichten\.html/i.test(a.href));
+                        .find(a => /\.\d{6,}\.html$/i.test(new URL(a.href, location.href).pathname)
+                                && !/nachrichten|login|cuba|mein-wg/i.test(a.href));
                     return link?.href?.replace(/#.*$/, "") || null;
                 });
-                listingId = extractListingIdFromUrl(threadAdUrl);
-                if (!listingId) listingId = await findListingId(thread.adTitle);
-                if (listingId) log(`  listing_id resolved from thread: ${listingId}`);
+                ({ listingId, source } = resolveListingId(thread.adTitle, threadAdUrl, approxTime, listingCandidates));
+                if (listingId) log(`  listing_id resolved from thread: ${listingId} via ${source}`);
             }
 
             await backfillConversationListing(thread, listingId);
