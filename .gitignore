@@ -1,4 +1,5 @@
 node_modules/
+ms-playwright/
 .env
 gmail/gmail_token.json
 gmail/const/

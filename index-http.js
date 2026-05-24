@@ -748,7 +748,7 @@ function deepRender(value, scope) {
     if (typeof value !== 'string') return value;
 
     // If the entire string is a single ${...} expression, return the raw resolved value
-    // preserving its original type (number, boolean, object, etc.)
+    // preserving its original type (number, boolean, object, null, etc.)
     const singleMatch = value.match(/^\$\{([^}]+)\}$/);
     if (singleMatch) {
         const [rawPath, rawFilter] = singleMatch[1].split('|').map(s => s.trim());
@@ -758,8 +758,8 @@ function deepRender(value, scope) {
             if (val == null) break;
             val = val[part];
         }
-        val = val ?? '';
-        if (!rawFilter) return val; // ← returns number, boolean, object as-is
+        if (val === undefined) val = null; // undefined path → null; explicit null stays null
+        if (!rawFilter) return val; // ← returns number, boolean, object, null as-is
         if (rawFilter === 'b64tohex') return b64tohex(val);
         return String(val);
     }
@@ -1291,14 +1291,15 @@ async function tool_manage_cron_job({ mode = 'schedule', args = {} }) {
 
 // The CHAIN runner
 async function runChain(chainId, chainArgs) {
-    // chainArgs: { steps: [ { name, arguments, saveAs? }, ... ], vars? }
-    const { steps = [], vars = {} } = chainArgs || {};
+    // chainArgs: { steps: [ { name, arguments, saveAs?, continueOnError? }, ... ], vars?, stopOnError? }
+    const { steps = [], vars = {}, stopOnError = true } = chainArgs || {};
     saveVar(chainId, '__init__', true); // ensure bag exists
     Object.assign(getVars(chainId), vars); // seed variables
 
     const outputs = [];
 
-    for (const step of steps) {
+    for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
         if (!step || !step.name) throw new Error('chain step missing "name"');
 
         // Render the step arguments using accumulated variables
@@ -1320,8 +1321,16 @@ async function runChain(chainId, chainArgs) {
             saveVar(chainId, step.saveAs, jsonOut);
         }
 
-        // Push a summarized output for the /sse result
-        outputs.push({ step: step.name, args: resolvedArgs, result: jsonOut });
+        const stepOut = { step: step.name, stepIndex: i, args: resolvedArgs, result: jsonOut };
+
+        // Halt on error unless step opts out or chain-level stopOnError is false
+        const hasError = jsonOut && typeof jsonOut === 'object' && jsonOut.error;
+        if (hasError && stopOnError !== false && step.continueOnError !== true) {
+            outputs.push({ ...stepOut, halted: true });
+            return outputs;
+        }
+
+        outputs.push(stepOut);
     }
     return outputs;
 }
@@ -1821,7 +1830,7 @@ function structuredError(code, details) {
 }
 
 
-async function execOrThrow(p){ try{ return await p; } catch(e){ throw mapApiError(e); } }
+async function execOrThrow(p){ let r; try{ r = await p; } catch(e){ throw mapApiError(e); } if(r?.error) throw mapApiError(r.error); return r; }
 
 /* ========================= Relative time ========================= */
 function parseRelativeTime(v){
@@ -2185,11 +2194,13 @@ function toolsPayload(){
                           properties: {
                               name: { type: 'string' },
                               arguments: { type: 'object', additionalProperties: true },
-                              saveAs: { type: 'string', description: 'Save this step output into ${saveAs} for later interpolation' }
+                              saveAs: { type: 'string', description: 'Save this step output into ${saveAs} for later interpolation' },
+                              continueOnError: { type: 'boolean', description: 'If true, continue to next step even if this step returns an error (overrides chain-level stopOnError)' }
                           },
                           required: ['name', 'arguments']
                       }
-                  }
+                  },
+                  stopOnError: { type: 'boolean', description: 'If true (default), halt the chain when any step returns an error and include halted:true on the failing step. Set false to always run all steps.' }
               },
               required: ['steps']
           }
@@ -3103,6 +3114,7 @@ async function tool_update_data(args) {
                 let v = rowOrWhere?.[c] ?? where?.[c];
                 // Unwrap {op, value} filter objects to get the scalar
                 if (v && typeof v === 'object' && 'value' in v) v = v.value;
+                if (v && typeof v === 'object' && 'eq' in v) v = v.eq;
                 if (v === undefined || v === null) return null;
                 w[c] = v;
             }
@@ -3301,9 +3313,15 @@ async function tool_update_data(args) {
             const got = proj?.data ?? [];
             if (got.length === 1) {
                 const g = got[0];
-                verified = Object.entries(patch).every(([k, v]) =>
-                (v && typeof v === "object") ? true : (g[k] === v || v === null || String(g[k]) === String(v))
-                );
+                verified = Object.entries(patch).every(([k, v]) => {
+                    if (k === "updated_at" || k === "created_at") return true;
+                    if (v && typeof v === "object") return true;
+                    if (v === null || v === undefined) return g[k] === null || g[k] === undefined;
+                    const dbVal = g[k];
+                    if (dbVal === v) return true;
+                    if (typeof v === "string" && typeof dbVal === "string" && dbVal.startsWith(v)) return true;
+                    return String(dbVal) === String(v);
+                });
                 rows = got;
             }
             } else {
@@ -3340,9 +3358,15 @@ async function tool_update_data(args) {
                 );
                 urows = proj2?.data ?? urows;
                 const g2 = (proj2?.data ?? [])[0];
-                verified = !!g2 && Object.entries(patch).every(([k, v]) =>
-                    (v && typeof v === "object") ? true : (g2[k] === v || v === null || String(g2[k]) === String(v))
-                );
+                verified = !!g2 && Object.entries(patch).every(([k, v]) => {
+                    if (k === "updated_at" || k === "created_at") return true;
+                    if (v && typeof v === "object") return true;
+                    if (v === null || v === undefined) return g2[k] === null || g2[k] === undefined;
+                    const dbVal = g2[k];
+                    if (dbVal === v) return true;
+                    if (typeof v === "string" && typeof dbVal === "string" && dbVal.startsWith(v)) return true;
+                    return String(dbVal) === String(v);
+                });
                 } else {
                 verified = Array.isArray(urows) && urows.length > 0;
                 }
