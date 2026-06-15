@@ -9,6 +9,8 @@
 
 import { callTool } from "./mcp.js";
 
+const LOCAL_TIMEZONE = "Europe/Berlin";
+
 /* -------------------------------------------------------------------------- */
 /* 🧠 Utility Functions                                                       */
 /* -------------------------------------------------------------------------- */
@@ -57,12 +59,12 @@ function formatEventTime(start_time) {
         hour: "numeric",
         minute: "2-digit",
         hour12: true,
-        timeZone: "America/Chicago"
+        timeZone: LOCAL_TIMEZONE
     });
 
     // Get the event date in Central Time for comparison
     const eventDateStr = date.toLocaleDateString("en-US", {
-        timeZone: "America/Chicago",
+        timeZone: LOCAL_TIMEZONE,
         year: "numeric",
         month: "2-digit",
         day: "2-digit"
@@ -70,7 +72,7 @@ function formatEventTime(start_time) {
 
     // Get today's date in Central Time
     const nowCentral = new Date().toLocaleDateString("en-US", {
-        timeZone: "America/Chicago",
+        timeZone: LOCAL_TIMEZONE,
         year: "numeric",
         month: "2-digit",
         day: "2-digit"
@@ -80,7 +82,7 @@ function formatEventTime(start_time) {
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
     const tomorrowDateStr = tomorrow.toLocaleDateString("en-US", {
-        timeZone: "America/Chicago",
+        timeZone: LOCAL_TIMEZONE,
         year: "numeric",
         month: "2-digit",
         day: "2-digit"
@@ -100,9 +102,18 @@ function formatEventTime(start_time) {
     const dateStr = date.toLocaleDateString("en-US", {
         month: "short",
         day: "numeric",
-        timeZone: "America/Chicago"
+        timeZone: LOCAL_TIMEZONE
     });
     return `${dateStr} at ${timeStr}`;
+}
+
+/** Format a duration in minutes as a human-readable string */
+function formatDuration(minutes) {
+    if (minutes < 60) return `in ${minutes} min`;
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    const hourStr = h === 1 ? "1 hour" : `${h} hours`;
+    return m === 0 ? `in ${hourStr}` : `in ${hourStr} ${m} min`;
 }
 
 /** Get current time in ISO format */
@@ -202,10 +213,11 @@ async function sendOnTheDayNotification(event, runId) {
 async function sendBeforeEventNotification(event, runId) {
     const eventTime = formatEventTime(event.start_time);
     const minutes = event.notify_before_event_minutes;
+    const duration = formatDuration(minutes);
     const title = `⏰ Reminder: ${event.title}`;
     const body = event.location
-        ? `In ${minutes} min • ${eventTime} • ${event.location}}`
-        : `In ${minutes} min • ${eventTime}`;
+        ? `${duration} • ${eventTime} • ${event.location}`
+        : `${duration} • ${eventTime}`;
 
     try {
         await callTool("notify_push", {
@@ -281,14 +293,12 @@ async function sendAtStartNotification(event, runId) {
 async function processOnTheDayNotifications(runId) {
     console.log(`[${runId}] 🔍 Checking for "on the day" notifications...`);
 
-    // Get current time in Central Time
-    const nowCentral = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Chicago" }));
-
-    // Calculate today's date range in Central Time
-    const todayStartCentral = new Date(nowCentral.getFullYear(), nowCentral.getMonth(), nowCentral.getDate());
-
-    // Get current time in HH:MM:SS format (Central Time)
-    const currentTimeCentral = nowCentral.toTimeString().split(" ")[0]; // "HH:MM:SS"
+    // Use UTC for both date and time — notify_on_the_day_time is stored as UTC
+    // Using local timezone for the date check caused midnight-flip firing (local day starts
+    // before UTC day, but UTC notify time has already passed, so it fires instantly)
+    const nowUTC = new Date();
+    const todayUTC = nowUTC.toISOString().slice(0, 10); // "YYYY-MM-DD"
+    const currentTimeUTC = nowUTC.toISOString().slice(11, 19); // "HH:MM:SS"
 
     // Query both tables
     const rows = await queryBothEventTables(
@@ -304,28 +314,17 @@ async function processOnTheDayNotifications(runId) {
 
     let sent = 0;
     for (const event of rows) {
-        // Get event's date in Central Time
-        const eventDate = new Date(event.start_time);
-        const eventDateCentral = eventDate.toLocaleDateString("en-US", {
-            timeZone: "America/Chicago",
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit"
-        });
-        const todayDateCentral = todayStartCentral.toLocaleDateString("en-US", {
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit"
-        });
+        // Check event date in UTC — consistent with notify_on_the_day_time being UTC
+        const eventDateUTC = new Date(event.start_time).toISOString().slice(0, 10);
 
-        // Only process if event is actually today in Central Time
-        if (eventDateCentral !== todayDateCentral) {
+        // Only process if event is actually today in UTC
+        if (eventDateUTC !== todayUTC) {
             continue;
         }
 
-        // Check if current time >= notification time
-        const notifyTime = event.notify_on_the_day_time || "08:00:00";
-        if (currentTimeCentral >= notifyTime) {
+        // Check if current UTC time >= notification UTC time
+        const notifyTime = event.notify_on_the_day_time || "09:00:00";
+        if (currentTimeUTC >= notifyTime) {
             const success = await sendOnTheDayNotification(event, runId);
             if (success) sent++;
             await new Promise((r) => setTimeout(r, 250)); // Rate limiting
@@ -380,7 +379,7 @@ async function processAtStartNotifications(runId) {
     console.log(`[${runId}] 🔍 Checking for "at start" notifications...`);
 
     // Get current time in Central Time
-    const nowCentral = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Chicago" }));
+    const nowCentral = new Date(new Date().toLocaleString("en-US", { timeZone: LOCAL_TIMEZONE }));
     const oneMinuteAgo = new Date(nowCentral.getTime() - 1 * 60 * 1000);
     const oneMinuteAhead = new Date(nowCentral.getTime() + 1 * 60 * 1000);
 
@@ -399,7 +398,7 @@ async function processAtStartNotifications(runId) {
     let sent = 0;
     for (const event of rows) {
         // Convert event start time to Central Time for comparison
-        const eventStartCentral = new Date(new Date(event.start_time).toLocaleString("en-US", { timeZone: "America/Chicago" }));
+        const eventStartCentral = new Date(new Date(event.start_time).toLocaleString("en-US", { timeZone: LOCAL_TIMEZONE }));
 
         // Check if event start time is within ±1 minute of current Central Time
         if (eventStartCentral >= oneMinuteAgo && eventStartCentral < oneMinuteAhead) {

@@ -423,7 +423,6 @@ function readColsAllowFor(fqtn){ return envCsv(`DBREAD_COL_ALLOWLIST_${fqtn}`); 
 function writeColsAllowFor(fqtn){ const s1=envCsv(`DB_WRITE_COL_ALLOWLIST_${fqtn}`); const s2=envCsv(`DBWRITE_COL_ALLOWLIST_${fqtn}`); return new Set([...s1,...s2]); }
 
 /* ========================= Health Steps (env) ========================= */
-const HEALTH_TABLE_NAME = process.env.HEALTH_TABLE_NAME || 'health_metrics';
 const HEALTHKIT_INGEST_TOKEN = process.env.HEALTHKIT_INGEST_TOKEN || '';
 
 /* ========================= Boot checks ========================= */
@@ -883,7 +882,6 @@ async function callOneToolByName(name, args) {
     else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
         return tool_finalize_verification(args);
     else if (name === 'enforce_mapping') return tool_enforce_mapping(args);
-    else if (name === 'query_health_metrics_range') return tool_query_health_metrics_range(args);
     else if (name === 'chain') {
         const chainId = crypto.randomUUID?.() || Math.random().toString(36).slice(2);
         return asJsonContent(await runChain(chainId, args));
@@ -1719,7 +1717,6 @@ app.post('/sse', async (req, res) => {
             else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
                 content = await tool_finalize_verification(args);
             else if (name === 'enforce_mapping') content = await tool_enforce_mapping(args);
-            else if (name === 'query_health_metrics_range') content = await tool_query_health_metrics_range(args);
             else if (name === 'rpc_expose_constraints_filtered') {
                 const { target_schema, target_table } = args;
                 const { data, error } = await supabase.rpc('rpc_expose_constraints_filtered', {
@@ -3320,6 +3317,7 @@ async function tool_update_data(args) {
                     const dbVal = g[k];
                     if (dbVal === v) return true;
                     if (typeof v === "string" && typeof dbVal === "string" && dbVal.startsWith(v)) return true;
+                    try { const dA = new Date(dbVal), dB = new Date(v); if (!isNaN(dA) && !isNaN(dB) && dA.getTime() === dB.getTime()) return true; } catch {}
                     return String(dbVal) === String(v);
                 });
                 rows = got;
@@ -3365,6 +3363,7 @@ async function tool_update_data(args) {
                     const dbVal = g2[k];
                     if (dbVal === v) return true;
                     if (typeof v === "string" && typeof dbVal === "string" && dbVal.startsWith(v)) return true;
+                    try { const dA = new Date(dbVal), dB = new Date(v); if (!isNaN(dA) && !isNaN(dB) && dA.getTime() === dB.getTime()) return true; } catch {}
                     return String(dbVal) === String(v);
                 });
                 } else {
@@ -5163,6 +5162,14 @@ async function tool_notify_push(args){
     };
     headers['Content-Type'] = 'application/json';
   } else if (provider === 'pushover') {
+      const PUSHOVER_CATEGORIES = [
+          'gmail', 'calendar_events', 'calendar_recurring', 'purchases', 'facebook_marketplace',
+          'today_quick', 'today_medium', 'today_deep',
+          'quick', 'medium', 'deep', 'projects', 'poshmark',
+      ];
+      if (!args.api_token && !args.category) {
+          throw new Error(`notify_push: category is required for Pushover. Available categories: ${PUSHOVER_CATEGORIES.join(', ')}`);
+      }
       const userKey = args.user_key || process.env.PUSHOVER_USER_KEY;
       const apiToken = args.api_token || (
           args.category === 'gmail' ? process.env.PUSHOVER_TOKEN_GMAIL :
@@ -5181,9 +5188,9 @@ async function tool_notify_push(args){
                                               args.category === 'deep' ? process.env.PUSHOVER_TOKEN_DEEP :
                                                   args.category === 'projects' ? process.env.PUSHOVER_TOKEN_PROJECTS :
                                           args.category === 'poshmark' ? process.env.PUSHOVER_TOKEN_POSHMARK :
-                      process.env.PUSHOVER_API_TOKEN
+                      undefined
       );
-      if (!userKey || !apiToken) throw new Error('notify_push: missing Pushover user_key or api_token');
+      if (!userKey || !apiToken) throw new Error(`notify_push: missing Pushover user_key or api_token for category "${args.category}". Available categories: ${PUSHOVER_CATEGORIES.join(', ')}`);
       url = "https://api.pushover.net/1/messages.json";
       payload = { token: apiToken, user: userKey, message: body || message || '', title, priority: args.priority || 0 };
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
