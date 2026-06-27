@@ -1,0 +1,5 @@
+ms-playwright/
+node_modules/
+logs/
+wg_messages_rows.json
+package-lock.json

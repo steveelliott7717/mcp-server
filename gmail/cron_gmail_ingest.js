@@ -402,7 +402,7 @@ export async function ingestGmailMessages() {
                             subject: subject,  // ← ADD THIS (decoded subject)
                             body_text: body.text || null,  // ← ADD THIS
                             body_html: body.html || null,  // ← ADD THIS
-                            snippet: data.snippet || "",
+                            push_body: data.snippet || "",
                             labels: labelIds,
                             is_read: !labelIds.includes("UNREAD"),
                             is_starred: labelIds.includes("STARRED"),
@@ -492,7 +492,7 @@ export async function ingestGmailMessages() {
                     bcc_email: headers["bcc"] || null,
                     reply_to: headers["reply-to"] || null,
                     subject,
-                    snippet: data.snippet || "",
+                    push_body: data.snippet || "",
                     gmail_date: new Date(date).toISOString(),
                     message_type: messageType,
                     body_text: body.text || null,

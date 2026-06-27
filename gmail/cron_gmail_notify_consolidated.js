@@ -44,9 +44,9 @@ function parseToolResponse(res) {
 
     return null;
 }
-/** Clean Gmail snippet text for push notifications */
-function cleanSnippet(snippet = "") {
-    return snippet
+/** Clean push_body text for push notifications */
+function cleanPushBody(text = "") {
+    return text
         .replace(/&lt;/g, "<")
         .replace(/&gt;/g, ">")
         .replace(/&amp;/g, "&")
@@ -70,7 +70,7 @@ async function notifyNewReplies() {
         const res = await callTool("query_table", {
             schema: "gmail",
             table: "all_emails",
-            select: ["message_id", "from_email", "snippet", "tracked_tag", "subject", "gmail_date"],
+            select: ["message_id", "from_email", "push_body", "tracked_tag", "subject", "gmail_date"],
             where: {
                 is_reply_to_tracked: { eq: true },
                 notified_at: { eq: null }
@@ -96,7 +96,7 @@ async function notifyNewReplies() {
     let notified = 0;
     for (const r of rows) {
         const messageId = r.message_id;
-        const cleaned = cleanSnippet(r.snippet || "");
+        const cleaned = cleanPushBody(r.push_body || "");
         const tagLabel = r.tracked_tag ? ` [${r.tracked_tag}]` : "";
         const fromName = r.from_email?.split("@")[0] || "Unknown Sender";
 

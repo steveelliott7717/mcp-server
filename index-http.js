@@ -483,25 +483,26 @@ app.use((req, res, next) => {
     const trust = req.get('X-MCP-Trust');
     const local = req.ip === '127.0.0.1' || req.ip === '::1';
 
-    // ✅ Allow ChatGPT MCP connections (bypass for /sse and /tools used by MCP runtime)
-    if (req.path.startsWith('/sse') || req.path.startsWith('/tools')) {
-        console.log('[AUTH BYPASS] Allowing MCP system route:', req.path);
+    // ✅ Public routes — no auth needed
+    if (req.path.startsWith('/sse-readonly') || req.path.startsWith('/tools') ||
+        req.path === '/health' || req.path === '/gpt/health') {
         return next();
     }
 
-    // ✅ Normal local or trusted header access
+    // ✅ Auth: trust header, URL token, or direct localhost (crons bypass nginx)
+    const urlToken = req.query.token || '';
+    const directLocal = local && !req.get('X-Real-IP');
     if (
         trust === process.env.MCP_TRUST_TOKEN ||
-        local ||
-        req.path === '/health' ||
-        req.path === '/gpt/health'
+        (urlToken && urlToken === process.env.MCP_URL_TOKEN) ||
+        directLocal
     ) {
         return next();
     }
 
     // ❌ Everything else is blocked
-    console.error('[AUTH BLOCKED]', req.method, req.path, { trust });
-    res.status(403).json({ error: 'Forbidden: missing or invalid X-MCP-Trust header' });
+    console.error('[AUTH BLOCKED]', req.method, req.path, { trust: !!trust, token: !!urlToken });
+    res.status(403).json({ error: 'Forbidden' });
 });
 
 
@@ -1465,6 +1466,10 @@ app.use('/sse', (req, res, next) => {
         if (b.method === 'initialize') return next();
     }
 
+    // allow direct localhost (crons bypassing nginx)
+    const localIp = req.ip === '127.0.0.1' || req.ip === '::1';
+    if (localIp && !req.get('X-Real-IP')) return next();
+
     // collect creds from all supported places
     const bearerRaw = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
     const urlTok = req.query.token || req.get('x-mcp-token') || '';
@@ -1511,7 +1516,8 @@ const sseLimiter = rateLimit({
   message: { error: 'Too many requests, slow down.' }
 });
 app.use('/sse', (req, res, next) => {
-    if (isTrustedClient(req)) return next();
+    const localDirect = (req.ip === '127.0.0.1' || req.ip === '::1') && !req.get('X-Real-IP');
+    if (isTrustedClient(req) || localDirect) return next();
     manualLimiter(req, res, (err) => {
         if (err) return next(err);
         sseLimiter(req, res, next);
@@ -1771,6 +1777,109 @@ app.post('/sse', async (req, res) => {
 
 
 
+
+/* ========================= /sse-readonly — read-only MCP endpoint ========================= */
+
+const READONLY_ALLOWED_SCHEMAS = new Set(['professional_profile', 'health']);
+
+const READONLY_TOOLS = new Set([
+    'query_table', 'list_schemas', 'list_tables', 'list_columns',
+    'list_rpcs', 'list_functions', 'list_triggers', 'list_event_triggers',
+    'list_views', 'list_matviews',
+    'get_function_definition', 'get_view_definition', 'get_trigger_definition',
+    'rpc_expose_constraints_filtered', 'rpc_expose_indexes_filtered',
+]);
+
+function readonlyToolsPayload() {
+    const full = toolsPayload();
+    return { tools: full.tools.filter(t => READONLY_TOOLS.has(t.name)) };
+}
+
+app.get('/sse-readonly', (req, res) => {
+    console.log('[SSE-READONLY] GET connection opened');
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.flushHeaders();
+    res.write(': connected\n\n');
+    const pingInterval = setInterval(() => { res.write(': ping\n\n'); }, 15000);
+    req.on('close', () => { console.log('[SSE-READONLY] GET connection closed'); clearInterval(pingInterval); });
+});
+
+app.post('/sse-readonly', async (req, res) => {
+    try {
+        const jr = req.body || {};
+        if (!jr || typeof jr !== 'object' || !jr.method) {
+            return res.status(400).json(rpcErr(jr?.id ?? 0, -32600, 'Invalid JSON-RPC: missing method'));
+        }
+
+        if (jr.method === 'initialize') {
+            return res.json(rpcOK(jr.id ?? 0, {
+                protocolVersion: '2025-06-18',
+                capabilities: { tools: {} },
+                serverInfo: { name: 'mcp-supabase-readonly', version: '1.0.0' }
+            }));
+        }
+
+        if (jr.method && jr.method.startsWith('notifications/')) return res.status(204).end();
+
+        if (jr.method === 'tools/list') {
+            return res.json(rpcOK(jr.id ?? 0, readonlyToolsPayload()));
+        }
+
+        if (jr.method === 'tools/call') {
+            const params = jr.params || {};
+            const name = params.name || params.tool?.name;
+            const args = params.arguments || params.tool?.arguments || {};
+
+            if (!name) return res.json(rpcErr(jr.id, -32602, 'Invalid tool call: no name'));
+
+            if (!READONLY_TOOLS.has(name)) {
+                return res.json(rpcErr(jr.id, -32601, `Tool '${name}' is not available in read-only mode`));
+            }
+
+            const schema = args.schema || args.p_schema || args.target_schema || 'public';
+            if (schema !== 'public' && !READONLY_ALLOWED_SCHEMAS.has(schema)) {
+                return res.json(rpcErr(jr.id, -32602, `Schema '${schema}' is not accessible in read-only mode. Allowed: ${[...READONLY_ALLOWED_SCHEMAS].join(', ')}`));
+            }
+
+            let content;
+            if (name === 'query_table') content = await tool_query_table(args);
+            else if (name === 'list_schemas') content = asJsonContent([...READONLY_ALLOWED_SCHEMAS]);
+            else if (name === 'list_tables') content = await tool_list_tables(args);
+            else if (name === 'list_columns') content = await tool_list_columns(args);
+            else if (name === 'list_rpcs') content = await tool_list_rpcs(args);
+            else if (name === 'get_function_definition') content = await tool_get_function_definition(args);
+            else if (name === 'list_functions') content = await tool_list_functions(args);
+            else if (name === 'list_triggers') content = await tool_list_triggers(args);
+            else if (name === 'list_event_triggers') content = await tool_list_event_triggers(args);
+            else if (name === 'list_views') content = await tool_list_views(args);
+            else if (name === 'list_matviews') content = await tool_list_matviews(args);
+            else if (name === 'get_view_definition') content = await tool_get_view_definition(args);
+            else if (name === 'get_trigger_definition') content = await tool_get_trigger_definition(args);
+            else if (name === 'rpc_expose_constraints_filtered') {
+                const { data, error } = await supabase.rpc('rpc_expose_constraints_filtered', { target_schema: args.target_schema, target_table: args.target_table });
+                if (error) throw error;
+                content = asJsonContent(data || []);
+            }
+            else if (name === 'rpc_expose_indexes_filtered') {
+                const { data, error } = await supabase.rpc('rpc_expose_indexes_filtered', { target_schema: args.target_schema, target_table: args.target_table });
+                if (error) throw error;
+                content = asJsonContent(data || []);
+            }
+
+            return res.json({ jsonrpc: '2.0', id: jr.id, result: { content } });
+        }
+
+        if (jr.id === undefined || jr.id === null) return res.status(204).end();
+        return res.json(rpcErr(jr.id, -32601, `Unknown method '${jr.method}'`));
+    } catch (e) {
+        return res.json(rpcErr(req.body?.id ?? 0, e?.code || -32000, e?.message || String(e), e?.details || null));
+    }
+});
+
+/* ========================= End /sse-readonly ========================= */
 
 async function verifyRowsChanged(schema, table, pkCol, ids, opName) {
   if (!ids?.length) {

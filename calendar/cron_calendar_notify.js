@@ -293,11 +293,10 @@ async function sendAtStartNotification(event, runId) {
 async function processOnTheDayNotifications(runId) {
     console.log(`[${runId}] 🔍 Checking for "on the day" notifications...`);
 
-    // Use UTC for both date and time — notify_on_the_day_time is stored as UTC
-    // Using local timezone for the date check caused midnight-flip firing (local day starts
-    // before UTC day, but UTC notify time has already passed, so it fires instantly)
+    // Use Berlin for date check (matches formatEventTime) and UTC for time check
+    // (notify_on_the_day_time is stored as UTC)
     const nowUTC = new Date();
-    const todayUTC = nowUTC.toISOString().slice(0, 10); // "YYYY-MM-DD"
+    const todayBerlin = nowUTC.toLocaleDateString("en-CA", { timeZone: LOCAL_TIMEZONE }); // "YYYY-MM-DD"
     const currentTimeUTC = nowUTC.toISOString().slice(11, 19); // "HH:MM:SS"
 
     // Query both tables
@@ -314,11 +313,11 @@ async function processOnTheDayNotifications(runId) {
 
     let sent = 0;
     for (const event of rows) {
-        // Check event date in UTC — consistent with notify_on_the_day_time being UTC
-        const eventDateUTC = new Date(event.start_time).toISOString().slice(0, 10);
+        // Check event date in Berlin — consistent with how formatEventTime displays it
+        const eventDateBerlin = new Date(event.start_time).toLocaleDateString("en-CA", { timeZone: LOCAL_TIMEZONE });
 
-        // Only process if event is actually today in UTC
-        if (eventDateUTC !== todayUTC) {
+        // Only process if event is actually today in Berlin time
+        if (eventDateBerlin !== todayBerlin) {
             continue;
         }
 

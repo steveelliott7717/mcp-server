@@ -27,7 +27,7 @@ async function callTool(name, args = {}) {
     const MCP_SERVER_URL =
         process.env.MCP_URL ||
         process.env.MCP_SERVER_URL ||
-        'http://127.0.0.1:3000/sse';
+        `${process.env.MCP_PUBLIC_URL}/sse`;
 
     const TRUST_TOKEN =
         process.env.MCP_TRUST_TOKEN ||
