@@ -1,6 +1,8 @@
 # MCP Server
 
-Production MCP (Model Context Protocol) server providing 20+ tools for LLM agents over HTTP. Built with Node.js/Express, backed by Supabase (PostgreSQL + pgvector), running as a systemd service.
+Production agent backend enabling LLMs to query databases, execute workflows, automate email/calendar, and make decisions using RAG + evaluation scoring.
+
+Built with Node.js/Express, backed by Supabase (PostgreSQL + pgvector), exposing 20+ tools over HTTP via the Model Context Protocol (MCP). Runs as a systemd service with CI/CD deployment and health monitoring.
 
 ## Architecture
 
