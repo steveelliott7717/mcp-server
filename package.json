@@ -2,7 +2,7 @@
     "type": "module",
     "name": "supabase-mcp-runtime",
     "version": "1.0.0",
-    "description": "Supabase MCP HTTP runtime for CRUD V2 GPT",
+    "description": "Production MCP server with RAG pipeline, LLM agent tooling, and SaaS API integrations",
     "main": "index-http.js",
     "scripts": {
         "start": "node index-http.js",
@@ -23,5 +23,5 @@
         "playwright": "^1.59.1",
         "uuid": "^13.0.0"
     },
-    "license": "ISC"
+    "private": true
 }

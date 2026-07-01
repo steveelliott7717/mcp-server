@@ -1485,9 +1485,8 @@ app.use('/sse', (req, res, next) => {
         (expectedBearer && ((bearer && bearer === expectedBearer) || (token && token === expectedBearer)));
 
     if (!ok) {
-        const exp = expectedTrust || expectedBearer || '';
         const got = trust || bearer || token || '';
-        console.error("[AUTH] Unauthorized: expected", JSON.stringify(exp), "got", JSON.stringify(got));
+        console.error("[AUTH] Unauthorized: got prefix", JSON.stringify(got.slice(0, 6) || '(empty)'));
         return res.status(401).json({ error: 'Unauthorized' });
     }
     next();
