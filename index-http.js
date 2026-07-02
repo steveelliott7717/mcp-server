@@ -27,9 +27,8 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 import mime from 'mime-types';
 import http from 'http';
-import fetch from "node-fetch";
 import { Buffer } from "buffer";
-import bodyParser from "body-parser";
+import { diffLines } from 'diff';
 import pino from 'pino';
 
 const logger = pino({
@@ -212,9 +211,13 @@ async function maybeInjectFacebookToken(args) {
             return args;
         }
 
-        // Inject as query param (Graph API standard)
-        const sep = args.url.includes('?') ? '&' : '?';
-        args.url = `${args.url}${sep}access_token=${token}`;
+        // Inject as Bearer header (supported by Graph API) so the token
+        // never appears in URLs captured by trace/meta logging
+        let h = args.headers;
+        if (typeof h === 'string') { try { h = JSON.parse(h); } catch { h = {}; } }
+        h = h || {};
+        if (!h['Authorization']) h['Authorization'] = `Bearer ${token}`;
+        args.headers = h;
 
         console.error(`[FB TOKEN INJECT] Injected token for ${u.hostname}`);
         return args;
@@ -228,9 +231,6 @@ async function maybeInjectFacebookToken(args) {
 
 // --- GitHub Token Refresher ---
 const GITHUB_TOKEN_PATH = "/opt/supabase-mcp/secrets/github_token.json";
-const GITHUB_APP_ID = process.env.GITHUB_APP_ID;
-const GITHUB_INSTALLATION_ID = process.env.GITHUB_INSTALLATION_ID;
-const GITHUB_PRIVATE_KEY_PATH = "/opt/supabase-mcp/secrets/github_app_private.pem";
 
 // For static tokens (PATs)
 async function ensureGithubTokenPresent() {
@@ -248,44 +248,9 @@ async function ensureGithubTokenPresent() {
     }
 }
 
-// For GitHub App tokens (auto-refresh)
-async function ensureGithubTokenFresh() {
-    try {
-        if (!GITHUB_APP_ID || !GITHUB_INSTALLATION_ID || !fs.existsSync(GITHUB_PRIVATE_KEY_PATH)) {
-            await ensureGithubTokenPresent(); // fallback to PAT check
-            return;
-        }
-
-        const privateKey = await fsp.readFile(GITHUB_PRIVATE_KEY_PATH, "utf8");
-        const now = Math.floor(Date.now() / 1000);
-        const payload = { iat: now - 60, exp: now + 9 * 60, iss: GITHUB_APP_ID };
-        const jwtToken = jwt.sign(payload, privateKey, { algorithm: "RS256" });
-
-        const res = await fetch(
-            `https://api.github.com/app/installations/${GITHUB_INSTALLATION_ID}/access_tokens`,
-            {
-                method: "POST",
-                headers: {
-                    Authorization: `Bearer ${jwtToken}`,
-                    Accept: "application/vnd.github+json",
-                },
-            }
-        );
-
-        if (!res.ok) throw new Error(`GitHub API ${res.status}`);
-        const data = await res.json();
-        const tokenData = { token: data.token, expires_at: data.expires_at };
-        await fsp.writeFile(GITHUB_TOKEN_PATH, JSON.stringify(tokenData, null, 2));
-
-        console.log("🔄 [GITHUB REFRESH] Token refreshed successfully");
-    } catch (err) {
-        console.error("❌ [GITHUB REFRESH] Failed to refresh token:", err.message);
-    }
-}
-
 // Run once on startup & schedule
-ensureGithubTokenFresh();
-setInterval(ensureGithubTokenFresh, 50 * 60 * 1000);
+ensureGithubTokenPresent();
+setInterval(ensureGithubTokenPresent, 50 * 60 * 1000);
 // --- end GitHub Token Refresher ---
 
 // --- Amadeus Token Auto-Refresher (Production Environment Only) ---
@@ -441,11 +406,10 @@ const MAX_JSON_BYTES = process.env.MCP_JSON_LIMIT || '5mb';
 
 const app = express();
 app.use(helmet());
-app.use(bodyParser.json({ limit: "100mb" }));
-app.use(bodyParser.urlencoded({ limit: "100mb", extended: true }));
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
+// nginx proxies to 127.0.0.1 and crons hit localhost — never expose directly
+server.listen(PORT, '127.0.0.1', () => {
     logger.info({ msg: 'MCP server started', port: PORT });
 });
 
@@ -453,6 +417,7 @@ server.listen(PORT, '0.0.0.0', () => {
 
 // ✅ JSON + CORS middleware (single setup)
 app.use(express.json({ limit: MAX_JSON_BYTES, type: ['application/json', 'text/plain'] }));
+app.use(express.urlencoded({ limit: MAX_JSON_BYTES, extended: true }));
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -460,7 +425,7 @@ app.use(cors({
     maxAge: 86400,
 }));
 app.options('*', (_req, res) => res.sendStatus(204));
-app.set('trust proxy', true);
+app.set('trust proxy', 'loopback');
 
 
 // Request logging middleware
@@ -492,11 +457,9 @@ app.use((req, res, next) => {
     // ✅ Auth: trust header, URL token, or direct localhost (crons bypass nginx)
     const urlToken = req.query.token || '';
     const directLocal = local && !req.get('X-Real-IP');
-    if (
-        trust === process.env.MCP_TRUST_TOKEN ||
-        (urlToken && urlToken === process.env.MCP_URL_TOKEN) ||
-        directLocal
-    ) {
+    const trustOk = !!process.env.MCP_TRUST_TOKEN && trust === process.env.MCP_TRUST_TOKEN;
+    const tokenOk = !!process.env.MCP_URL_TOKEN && urlToken === process.env.MCP_URL_TOKEN;
+    if (trustOk || tokenOk || directLocal) {
         return next();
     }
 
@@ -728,6 +691,11 @@ globalThis.callTool = async function callTool(name, args = {}) {
 // Per-run variables (scoped by chainId)
 const CHAIN_VARS = new Map();   // chainId -> { k:v }
 
+// Evict oldest entries so long-lived processes don't grow these maps unbounded
+function capMap(map, max) {
+    while (map.size > max) map.delete(map.keys().next().value);
+}
+
 // Basic filters (add more if you like)
 function b64tohex(b64) {
     // Strip optional data URL prefix
@@ -784,6 +752,7 @@ function saveVar(chainId, name, value) {
     const bag = CHAIN_VARS.get(chainId) || {};
     bag[name] = value;
     CHAIN_VARS.set(chainId, bag);
+    capMap(CHAIN_VARS, 200);
     return bag;
 }
 function getVars(chainId) {
@@ -894,7 +863,7 @@ async function callOneToolByName(name, args) {
             target_table
         });
         if (error) throw error;
-        content = asJsonContent(data || []);
+        return asJsonContent(data || []);
     }
     else if (name === 'rpc_expose_indexes_filtered') {
         const { target_schema, target_table } = args;
@@ -903,7 +872,7 @@ async function callOneToolByName(name, args) {
             target_table
         });
         if (error) throw error;
-        content = asJsonContent(data || []);
+        return asJsonContent(data || []);
     }
 
     throw new Error(`Unknown tool '${name}' in callOneToolByName`);
@@ -1009,7 +978,7 @@ async function tool_find_anchor({ relpath, anchor, context_lines = 20 }) {
     if (!filePath.startsWith(SAFE_BASE))
         throw new Error(`Path not allowed outside ${SAFE_BASE}`);
 
-    const text = await fs.readFile(filePath, "utf8");
+    const text = await fsp.readFile(filePath, "utf8");
     const lines = text.split(/\r?\n/);
     const idx = lines.findIndex((l) => l.includes(anchor));
 
@@ -1038,7 +1007,7 @@ async function tool_get_anchor_function_definition({ relpath, anchor }) {
         throw new Error(`Path not allowed outside ${SAFE_BASE}`);
     }
 
-    const text = await fs.readFile(filePath, "utf8");
+    const text = await fsp.readFile(filePath, "utf8");
     const startIdx = text.indexOf(anchor);
     if (startIdx === -1) {
         throw new Error(`Anchor not found: ${anchor}`);
@@ -1086,7 +1055,7 @@ async function tool_edit_slice({ relpath, start_line, end_line, new_lines }) {
         throw new Error(`Path not allowed outside ${SAFE_BASE}`);
     }
 
-    const text = await fs.readFile(filePath, "utf8");
+    const text = await fsp.readFile(filePath, "utf8");
     const lines = text.split(/\r?\n/);
 
     // Safety: ensure valid bounds
@@ -1100,12 +1069,12 @@ async function tool_edit_slice({ relpath, start_line, end_line, new_lines }) {
 
     // Backup before overwrite
     const backupPath = `${filePath}.bak-${Date.now()}`;
-    await fs.writeFile(backupPath, text, "utf8");
+    await fsp.writeFile(backupPath, text, "utf8");
 
     // Atomic write using temp file + rename
     const tmpPath = `${filePath}.tmp-${Date.now()}`;
-    await fs.writeFile(tmpPath, merged.join("\n"), { mode: 0o600 });
-    await fs.rename(tmpPath, filePath);
+    await fsp.writeFile(tmpPath, merged.join("\n"), { mode: 0o600 });
+    await fsp.rename(tmpPath, filePath);
 
     return [
         {
@@ -1168,8 +1137,8 @@ async function tool_revert_file({ relpath, backup }) {
         backupPath = path.join(dir, candidates[0]);
     }
 
-    const content = await fs.readFile(backupPath, "utf8");
-    await fs.writeFile(filePath, content, "utf8");
+    const content = await fsp.readFile(backupPath, "utf8");
+    await fsp.writeFile(filePath, content, "utf8");
 
     return [{ type: "json", json: { ok: true, restored: backupPath } }];
 }
@@ -1183,7 +1152,7 @@ async function tool_dry_run_edit({ relpath, start_line, end_line, new_lines }) {
     const filePath = path.join(SAFE_BASE, relpath);
     if (!filePath.startsWith(SAFE_BASE)) throw new Error(`Path not allowed outside ${SAFE_BASE}`);
 
-    const text = await fs.readFile(filePath, "utf8");
+    const text = await fsp.readFile(filePath, "utf8");
     const lines = text.split(/\r?\n/);
 
     const before = lines.slice(0, start_line - 1);
@@ -1200,7 +1169,6 @@ async function tool_dry_run_edit({ relpath, start_line, end_line, new_lines }) {
 
 // Helper: unified diff generator
 function generateUnifiedDiff(oldText, newText, fileName = "file") {
-    const { diffLines } = require("diff");
     const parts = diffLines(oldText, newText);
     let diff = `--- ${fileName}\n+++ ${fileName}\n`;
 
@@ -1394,6 +1362,7 @@ function resolveChainId(req, jr, params) {
 
 function setFinalVerified(chainId, v=true) {
   FINAL_VERIFIED_BY_CHAIN.set(chainId, !!v);
+  capMap(FINAL_VERIFIED_BY_CHAIN, 500);
 }
 function isFinalVerified(chainId) {
   return FINAL_VERIFIED_BY_CHAIN.get(chainId) === true;
@@ -1444,8 +1413,7 @@ function isTrustedClient(req) {
 
   return (
     (process.env.MCP_URL_TOKEN && bearer === process.env.MCP_URL_TOKEN) ||
-    (TRUST_TOKEN && got === TRUST_TOKEN) ||
-    origin.includes("chat.openai.com")
+    (TRUST_TOKEN && got === TRUST_TOKEN)
   );
 }
 
@@ -1503,6 +1471,12 @@ function manualLimiter(req, res, next) {
   const recent = arr.filter(t => now - t < MAN_WINDOW_MS);
   recent.push(now);
   manHits.set(ip, recent);
+  // Sweep stale IPs so the map doesn't accumulate one key per client forever
+  if (manHits.size > 1000) {
+    for (const [k, hits] of manHits) {
+      if (!hits.length || now - hits[hits.length - 1] >= MAN_WINDOW_MS) manHits.delete(k);
+    }
+  }
   if (recent.length > MAN_LIMIT) return res.status(429).json({ error: 'Too many requests (manual limiter)' });
   next();
 }
@@ -1838,8 +1812,15 @@ app.post('/sse-readonly', async (req, res) => {
                 return res.json(rpcErr(jr.id, -32601, `Tool '${name}' is not available in read-only mode`));
             }
 
-            const schema = args.schema || args.p_schema || args.target_schema || 'public';
-            if (schema !== 'public' && !READONLY_ALLOWED_SCHEMAS.has(schema)) {
+            // Resolve schema from a dotted table name so `private.foo` can't
+            // slip past the check; no implicit allow for 'public'
+            let schema;
+            if (args.table) {
+                ({ schema } = parseTable(args.table, args.schema || args.p_schema || args.target_schema));
+            } else {
+                schema = args.schema || args.p_schema || args.target_schema || 'public';
+            }
+            if (!READONLY_ALLOWED_SCHEMAS.has(schema)) {
                 return res.json(rpcErr(jr.id, -32602, `Schema '${schema}' is not accessible in read-only mode. Allowed: ${[...READONLY_ALLOWED_SCHEMAS].join(', ')}`));
             }
 
@@ -3260,10 +3241,9 @@ async function tool_update_data(args) {
                 const patch = {};
                 for (const [k, v] of Object.entries(row)) {
                 if (!pkCols.includes(k)) {
-                    if (v === undefined) patch[k] = null;
-                    else if (typeof v === "string" && v.trim() === "") patch[k] = null;
-                    else if (typeof v === "string" && !isNaN(v)) patch[k] = Number(v);
-                    else patch[k] = v;
+                    // Pass values through as-is and let Postgres cast — no
+                    // silent ""→null or numeric-string→Number coercion
+                    patch[k] = v === undefined ? null : v;
                 }
                 }
 
@@ -3306,16 +3286,11 @@ async function tool_update_data(args) {
             );
         }
 
-        // Normalize data payload (single object)
+        // Normalize data payload (single object) — values pass through as-is
+        // and Postgres casts; math ops ({op:'inc'|'dec'}) handled in two-phase below
         const normData = {};
         for (const [k, v] of Object.entries(data || {})) {
-            if (v === null || v === undefined) { normData[k] = null; continue; }
-            else if (typeof v === "string" && v.trim() === "") normData[k] = null;
-            else if (typeof v === "string" && !isNaN(v)) normData[k] = Number(v);
-            else if (typeof v === "object" && (v.op === "inc" || v.op === "dec")) {
-            // Math ops handled only in two-phase below
-            normData[k] = v;
-            } else normData[k] = v;
+            normData[k] = v === undefined ? null : v;
         }
 
         enforceWriteColsAllow(fqtn, normData);
@@ -4185,7 +4160,7 @@ Steve Elliott
 
     // --- Add tracking pixel if tracking is enabled ---
     if (shouldTrack) {
-        const pixelUrl = `https://${process.env.SUPABASE_PROJECT_REF}.supabase.co/functions/v1/track_email_open?tag=${tag}`;
+        const pixelUrl = `https://${process.env.SUPABASE_PROJECT_REF}.supabase.co/functions/v1/track-email-open?tag=${tag}`;
         const pixelHtml = `<img src="${pixelUrl}" width="1" height="1" style="display:none;" alt="">`;
 
         if (/<\/body>/i.test(finalBody)) {
@@ -4501,14 +4476,19 @@ Steve Elliott
 //////////////////////////////
 function isPrivateHost(host){
   const ipVer = net.isIP(host);
-  if (ipVer) {
-    if (host === '127.0.0.1' || host === '::1') return true;
+  if (ipVer === 4) {
     const parts = host.split('.').map(Number);
-    if (parts.length === 4) {
-      if (parts[0] === 10) return true;
-      if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-      if (parts[0] === 192 && parts[1] === 168) return true;
-    }
+    if (parts[0] === 0) return true;
+    if (parts[0] === 10) return true;
+    if (parts[0] === 127) return true;                       // whole 127/8
+    if (parts[0] === 169 && parts[1] === 254) return true;   // link-local / cloud metadata
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+  } else if (ipVer === 6) {
+    const h = host.toLowerCase();
+    if (h === '::' || h === '::1') return true;
+    if (h.startsWith('fe80') || h.startsWith('fc') || h.startsWith('fd')) return true;
+    if (h.startsWith('::ffff:')) return isPrivateHost(h.slice(7)); // v4-mapped
   }
   return false;
 }
@@ -4879,6 +4859,14 @@ async function tool_http_fetch(args){
         const toUrl = new URL(loc, currentUrl).toString();
         const policyList = normalizeHostsList(allow_redirect_hosts);
         if (!canRedirect(currentUrl, toUrl, redirect_policy, policyList)) throw new Error(`redirect blocked: ${toUrl}`);
+        // Re-run the same safety checks as the initial URL on every hop
+        const nextU = new URL(toUrl);
+        if (!hostAllowed(nextU.hostname, allowHosts, denyHosts)) throw new Error(`redirect host not allowed: ${nextU.hostname}`);
+        if (BROWSER_DENY_LOCALHOST) {
+          if (nextU.hostname === 'localhost' || isPrivateHost(nextU.hostname)) throw new Error('redirect to localhost/private IP blocked');
+          const rip = await resolveHostIPs(nextU.hostname);
+          if (rip.some(isPrivateHost)) throw new Error('redirect resolved to private IP — blocked');
+        }
         currentUrl = toUrl; redirects++; if (redirects > 10) throw new Error('too many redirects'); continue;
       }
 
@@ -4920,7 +4908,7 @@ async function tool_http_fetch(args){
 
       if (FETCH_CACHE_ENABLED) {
         const et = finalRes.headers.get('etag'); const lm = finalRes.headers.get('last-modified');
-        if (et || lm) __fetchCache.set(currentUrl, { etag:et, last_modified:lm });
+        if (et || lm) { __fetchCache.set(currentUrl, { etag:et, last_modified:lm }); capMap(__fetchCache, 500); }
       }
 
         // ✅ Read body with Node-compatible fallback
@@ -5401,56 +5389,6 @@ async function tool_browser_flow(args) {
     const jitter = Number(options.jitter_ms || 0);
     const results = [];
 
-    // --- Node.js dynamic multi-page screenshot helper ---
-    async function dynamicPageLoop({ waitSelector, screenshotOpts, safetyLimit = 50 }) {
-        let pageNum = 1;
-
-        while (true) {
-            // Scroll to bottom until all elements are loaded
-            await page.evaluate(async () => {
-                let previousHeight;
-                while (true) {
-                    const currentHeight = document.body.scrollHeight;
-                    if (previousHeight === currentHeight) break;
-                    previousHeight = currentHeight;
-                    window.scrollTo(0, document.body.scrollHeight);
-                    await new Promise(r => setTimeout(r, 2000));
-                }
-            });
-
-            // Wait for job cards to appear
-            if (waitSelector) await page.waitForSelector(waitSelector, { timeout: 10000 }).catch(() => { });
-
-            // Take screenshot and upload to Supabase
-            if (screenshotOpts) {
-                const buf = await page.screenshot({ fullPage: !!screenshotOpts.full_page });
-                console.log('Uploading page', pageNum, 'to Supabase...');
-                await saveToDestination(
-                    { type: 'supabase_storage' },
-                    buf,
-                    {
-                        bucket: screenshotOpts.destination_opts?.bucket || 'screenshots',
-                        path: screenshotOpts.destination_opts?.path?.replace('${pageNum}', pageNum) || `uploads/page_${pageNum}.png`,
-                        contentType: 'image/png'
-                    }
-                );
-            }
-
-            // Check for Next button
-            const nextBtn = await page.$('button[aria-label*="Next"]:not([disabled]), a[aria-label*="Next"]:not([aria-disabled="true"])');
-            if (!nextBtn) break;
-
-            await nextBtn.evaluate(btn => btn.scrollIntoView());
-            await page.waitForTimeout(1000);
-            await nextBtn.click();
-            await page.waitForTimeout(5000);
-
-            pageNum++;
-            if (pageNum > safetyLimit) break;
-        }
-    }
-
-
     try {
         for (const step of steps) {
             const op = (step.op || '').toLowerCase();
@@ -5567,19 +5505,20 @@ async function tool_browser_flow(args) {
                     }
 
                     // Wait/poll for target elements
-                    const elements = await pollElements(target, step.selector, step.timeout_ms || 30000);
+                    await pollElements(target, step.selector, step.timeout_ms || 30000);
 
-                    // Extract data
-                    const items = await target.evaluate((els, filterRegex) => {
-                        return els.map(el => ({
+                    // Extract in-page via $$eval — ElementHandles and RegExp
+                    // objects can't cross the serialization boundary
+                    const items = await target.$$eval(step.selector, (nodes, filterSrc) => {
+                        const rx = filterSrc ? new RegExp(filterSrc, 'i') : null;
+                        return nodes.map(el => ({
                             title: el.innerText,
                             link: el.href || null,
-                            extra: el.dataset || {}
-                        })).filter(item => !filterRegex || filterRegex.test(item.title));
-                    }, elements, step.textFilter ? new RegExp(step.textFilter, 'i') : null);
+                            extra: { ...el.dataset }
+                        })).filter(item => !rx || rx.test(item.title));
+                    }, step.textFilter || null);
 
                     results.push({ op: 'dynamicExtract', items });
-                    if (step.saveAs) saveVar(chainId, step.saveAs, items);
                     continue; // skip normal evaluate
                 }
 
@@ -6131,19 +6070,6 @@ app.post('/nl-command', async (req, res) => {
                 for (const m of details) summaryLines.push(`• ${m.subject} — ${m.from}`);
             }
 
-            if (wantSummary) {
-                const summarizePrompt = `Summarize these grouped emails into a concise report. Each group should be described in 1–2 sentences:\n---\n${summaryLines.join('\n')}`;
-                const summaryResponse = await fetch('http://localhost:3000/tools/call', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        name: 'openai_chat',
-                        arguments: { model: 'gpt-5', messages: [{ role: 'user', content: summarizePrompt }], max_tokens: 400 }
-                    })
-                }).then(r => r.json()).catch(() => null);
-                const aiSummary = summaryResponse?.content?.[0]?.json?.choices?.[0]?.message?.content || '(Could not summarize)';
-                return res.json({ ok: true, query: q, totalFound: messages.length, groups: Object.keys(groups).length || 1, summary: summaryLines.join('\n'), aiSummary });
-            }
-
             return res.json({ ok: true, query: q, totalFound: messages.length, groups: Object.keys(groups).length || 1, summary: summaryLines.join('\n') });
         }
 
@@ -6212,16 +6138,7 @@ app.post('/nl-command', async (req, res) => {
                             .map(h => h.value))
                     ));
                     const snippets = msgs.map(m => m.snippet).filter(Boolean).join('\n');
-                    const prompt = `Summarize this Gmail conversation between: ${participants.join(', ')}. Subject: ${subject}\nMessages:\n${snippets}`;
-                    const summaryResponse = await fetch('http://localhost:3000/tools/call', {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            name: 'openai_chat',
-                            arguments: { model: 'gpt-5', messages: [{ role: 'user', content: prompt }], max_tokens: 400 }
-                        })
-                    }).then(r => r.json()).catch(() => null);
-                    const aiSummary = summaryResponse?.content?.[0]?.json?.choices?.[0]?.message?.content || '(Could not summarize)';
-                    threadSummaries.push({ threadId, subject, participants, messageCount: msgs.length, summary: aiSummary });
+                    threadSummaries.push({ threadId, subject, participants, messageCount: msgs.length, summary: snippets.slice(0, 2000) });
                 } catch (err) {
                     console.error('[THREAD SUMMARY ERROR]', err.message);
                 }
@@ -6256,7 +6173,7 @@ app.post('/nl-command', async (req, res) => {
             }
 
             // --- Build RFC-compliant MIME message ---
-            const encodedMessage = buildGmailMime({
+            const encodedMessage = await buildGmailMime({
                 to,
                 from: sendAs,
                 subject,
@@ -6407,7 +6324,7 @@ app.use((err, req, res, next) => {
         res.status(500).json({
             error: 'Internal Server Error',
             message: err.message,
-            stack: err.stack
+            stack: process.env.NODE_ENV !== 'production' ? err.stack || null : null
         });
     }
 });
@@ -6415,10 +6332,10 @@ app.use((err, req, res, next) => {
 
 /* ========================= Start server ========================= */
 
-// Catch unhandled promise rejections
+// Log unhandled promise rejections but keep the service up;
+// only uncaughtException is fatal
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
-    process.exit(1);
+    console.error('[UNHANDLED REJECTION] at:', promise, 'reason:', reason);
 });
 
 // Catch uncaught exceptions
