@@ -24,10 +24,12 @@ import os from 'node:os';
 import { createClient } from '@supabase/supabase-js';
 import { URL } from 'node:url';
 import dns from 'node:dns/promises';
+import { lookup as dnsLookupCallback } from 'node:dns';
 import net from 'node:net';
 import mime from 'mime-types';
 import http from 'http';
 import { Buffer } from "buffer";
+import { Agent as UndiciAgent } from 'undici';
 import { diffLines } from 'diff';
 import pino from 'pino';
 
@@ -334,6 +336,7 @@ console.error('[Playwright ENV]', {
 /* ========================= Core Config ========================= */
 const SUPABASE_URL      = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_HOSTNAME = (() => { try { return new URL(SUPABASE_URL).hostname; } catch { return null; } })();
 //const PORT              = Number(process.env.PORT || 3000);
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -341,6 +344,18 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TRUST_TOKEN       = process.env.MCP_TRUST_TOKEN || '';
 const CURSOR_SECRET     = process.env.CURSOR_SIGNING_SECRET || '';
 const SSE_PING_MS       = Number(process.env.MCP_SSE_PING_MS || 15000);
+
+// Constant-time token comparison. Returns false for empty/unset expected
+// values so an unset secret never matches. The length check leaks only the
+// length (unavoidable with timingSafeEqual, which throws on length mismatch),
+// not the byte contents.
+function safeEqual(actual, expected) {
+    if (!expected) return false;
+    const A = Buffer.from(String(actual ?? ''), 'utf8');
+    const B = Buffer.from(String(expected), 'utf8');
+    if (A.length !== B.length) return false;
+    return crypto.timingSafeEqual(A, B);
+}
 
 const LOG_EVENTS        = (process.env.MCP_LOG_EVENTS || '0') === '1';
 const LOG_TABLE_FQTN    = process.env.MCP_LOG_TABLE || ''; // e.g. system.event_log
@@ -418,10 +433,16 @@ server.listen(PORT, '127.0.0.1', () => {
 // ✅ JSON + CORS middleware (single setup)
 app.use(express.json({ limit: MAX_JSON_BYTES, type: ['application/json', 'text/plain'] }));
 app.use(express.urlencoded({ limit: MAX_JSON_BYTES, extended: true }));
+// CORS origin is configurable: set MCP_CORS_ORIGINS to a comma-separated
+// allowlist (e.g. "https://claude.ai,https://chat.openai.com") to lock it down.
+// Defaults to '*' to preserve existing connector behavior. Note: auth here is
+// header/token-based, not cookie-based, so '*' does not expose credentialed
+// cross-origin reads — but an allowlist is available if you want it.
+const CORS_ORIGINS = (process.env.MCP_CORS_ORIGINS || '*').trim();
 app.use(cors({
-    origin: '*',
+    origin: CORS_ORIGINS === '*' ? '*' : CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean),
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-MCP-Trust', 'Origin', 'User-Agent'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-MCP-Trust', 'X-MCP-Dev-Token', 'x-mcp-token', 'Origin', 'User-Agent'],
     maxAge: 86400,
 }));
 app.options('*', (_req, res) => res.sendStatus(204));
@@ -454,17 +475,19 @@ app.use((req, res, next) => {
         return next();
     }
 
-    // ✅ Auth: trust header, URL token, or direct localhost (crons bypass nginx)
-    const urlToken = req.query.token || '';
+    // ✅ Auth: trust header, bearer/x-mcp-token header, or direct localhost
+    // (crons bypass nginx). Tokens are read from headers only — never from the
+    // query string, which leaks into access logs, browser history, and Referer.
+    const headerToken = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim() || req.get('x-mcp-token') || '';
     const directLocal = local && !req.get('X-Real-IP');
-    const trustOk = !!process.env.MCP_TRUST_TOKEN && trust === process.env.MCP_TRUST_TOKEN;
-    const tokenOk = !!process.env.MCP_URL_TOKEN && urlToken === process.env.MCP_URL_TOKEN;
+    const trustOk = safeEqual(trust, process.env.MCP_TRUST_TOKEN);
+    const tokenOk = safeEqual(headerToken, process.env.MCP_URL_TOKEN);
     if (trustOk || tokenOk || directLocal) {
         return next();
     }
 
     // ❌ Everything else is blocked
-    console.error('[AUTH BLOCKED]', req.method, req.path, { trust: !!trust, token: !!urlToken });
+    console.error('[AUTH BLOCKED]', req.method, req.path, { trust: !!trust, token: !!headerToken });
     res.status(403).json({ error: 'Forbidden' });
 });
 
@@ -550,17 +573,12 @@ app.post('/oauth/token', express.urlencoded({ extended: true }), (req, res) => {
 
     // Accept if client_secret matches our trust token
     // OR if client_id matches (for flexibility)
-    const isValid = (
-        (clientSecret && clientSecret === validToken) ||
-        (clientId && clientId === validToken)
-    );
+    const isValid = safeEqual(clientSecret, validToken) || safeEqual(clientId, validToken);
 
     if (!isValid) {
         console.error('[OAuth /token] Invalid credentials', {
             clientIdProvided: !!clientId,
-            clientSecretProvided: !!clientSecret,
-            clientSecretMatch: clientSecret === validToken,
-            clientIdMatch: clientId === validToken
+            clientSecretProvided: !!clientSecret
         });
         return res.status(401).json({
             error: 'invalid_client',
@@ -813,8 +831,27 @@ function asJsonContent(obj) {
     return [{ type: 'text', text: JSON.stringify(obj, null, 2) }];
 }
 
+// Runtime source-editing / exec / commit tools require a token separate from
+// the general MCP_TRUST_TOKEN — these tools rewrite server code and push to
+// git, a much larger blast radius than the CRUD/read tools sharing that token.
+const DEV_TOOLS = new Set([
+    'tool_edit_slice', 'tool_run_check', 'tool_commit_file',
+    'tool_revert_file', 'tool_dry_run_edit',
+    'tool_find_anchor', 'tool_get_anchor_function_definition',
+]);
+function isDevAuthorized(req) {
+    const token = req?.get?.('X-MCP-Dev-Token') || '';
+    return safeEqual(token, process.env.MCP_DEV_TOOLS_TOKEN);
+}
+function assertDevToolsAuthorized(name, devAuthorized) {
+    if (DEV_TOOLS.has(name) && !devAuthorized) {
+        throw new Error(`Tool '${name}' requires the dev-tools token (X-MCP-Dev-Token header)`);
+    }
+}
+
 // Single tool dispatch, reusing your existing handlers
-async function callOneToolByName(name, args) {
+async function callOneToolByName(name, args, devAuthorized = false) {
+    assertDevToolsAuthorized(name, devAuthorized);
     // keep this mapping in sync with your /sse dispatcher
     if (name === 'query_table') return tool_query_table(args);
     else if (name === 'insert_data') return tool_insert_data(args);
@@ -854,7 +891,7 @@ async function callOneToolByName(name, args) {
     else if (name === 'enforce_mapping') return tool_enforce_mapping(args);
     else if (name === 'chain') {
         const chainId = crypto.randomUUID?.() || Math.random().toString(36).slice(2);
-        return asJsonContent(await runChain(chainId, args));
+        return asJsonContent(await runChain(chainId, args, devAuthorized));
     }
     else if (name === 'rpc_expose_constraints_filtered') {
         const { target_schema, target_table } = args;
@@ -1088,13 +1125,17 @@ async function tool_edit_slice({ relpath, start_line, end_line, new_lines }) {
 // tool_run_check
 //////////////////////////////
 // Validate JavaScript syntax using Node.js
-async function tool_run_check({ relpath, command = "node --check" }) {
-    const { exec } = await import("child_process");
-    const target = relpath ? path.join("/opt/supabase-mcp/runtime", relpath) : null;
-    const cmd = target ? `${command} ${target}` : command;
+// No caller-controlled command: always `node --check <relpath>` under
+// SAFE_BASE, invoked via execFile (no shell) so nothing here is injectable.
+async function tool_run_check({ relpath }) {
+    const SAFE_BASE = "/opt/supabase-mcp/runtime";
+    if (!relpath) throw new Error("relpath is required");
+    const target = path.join(SAFE_BASE, relpath);
+    if (!target.startsWith(SAFE_BASE)) throw new Error(`Path not allowed outside ${SAFE_BASE}`);
 
+    const { execFile } = await import("child_process");
     return await new Promise((resolve) => {
-        exec(cmd, (err, stdout, stderr) => {
+        execFile(process.execPath, ["--check", target], (err, stdout, stderr) => {
             resolve([
                 {
                     type: "json",
@@ -1257,7 +1298,7 @@ async function tool_manage_cron_job({ mode = 'schedule', args = {} }) {
 
 
 // The CHAIN runner
-async function runChain(chainId, chainArgs) {
+async function runChain(chainId, chainArgs, devAuthorized = false) {
     // chainArgs: { steps: [ { name, arguments, saveAs?, continueOnError? }, ... ], vars?, stopOnError? }
     const { steps = [], vars = {}, stopOnError = true } = chainArgs || {};
     saveVar(chainId, '__init__', true); // ensure bag exists
@@ -1274,7 +1315,7 @@ async function runChain(chainId, chainArgs) {
         const resolvedArgs = deepRender(step.arguments || {}, scope);
 
         // Call the underlying tool
-        const content = await callOneToolByName(step.name, resolvedArgs);
+        const content = await callOneToolByName(step.name, resolvedArgs, devAuthorized);
         const jsonOut = extractFirstJson(content) ?? { content }; // fallback
 
         // Special case: collect base64 from browser_flow screenshot for later use
@@ -1408,13 +1449,9 @@ app.get('/CRUD.json', (_req, res) =>
 /* ========================= /sse auth + rate limit ========================= */
 function isTrustedClient(req) {
   const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
-    const got = req.get('X-MCP-Trust') || req.query.trust || '';
-  const origin = req.get('origin') || '';
+  const got = req.get('X-MCP-Trust') || '';
 
-  return (
-    (process.env.MCP_URL_TOKEN && bearer === process.env.MCP_URL_TOKEN) ||
-    (TRUST_TOKEN && got === TRUST_TOKEN)
-  );
+  return safeEqual(bearer, process.env.MCP_URL_TOKEN) || safeEqual(got, TRUST_TOKEN);
 }
 
 // ── Auth gate for /sse ─────────────────────────────────────────────
@@ -1438,19 +1475,20 @@ app.use('/sse', (req, res, next) => {
     const localIp = req.ip === '127.0.0.1' || req.ip === '::1';
     if (localIp && !req.get('X-Real-IP')) return next();
 
-    // collect creds from all supported places
+    // collect creds from headers only (never query string — it leaks into
+    // access logs, browser history, and Referer)
     const bearerRaw = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
-    const urlTok = req.query.token || req.get('x-mcp-token') || '';
+    const urlTok = req.get('x-mcp-token') || '';
     const trustHdr = req.get('X-MCP-Trust') || '';
-    const trustQ = req.query.trust || '';
 
     const bearer = normalize(bearerRaw);
     const token = normalize(urlTok);
-    const trust = normalize(trustHdr || trustQ);
+    const trust = normalize(trustHdr);
 
     const ok =
-        (expectedTrust && trust && trust === expectedTrust) ||
-        (expectedBearer && ((bearer && bearer === expectedBearer) || (token && token === expectedBearer)));
+        safeEqual(trust, expectedTrust) ||
+        safeEqual(bearer, expectedBearer) ||
+        safeEqual(token, expectedBearer);
 
     if (!ok) {
         const got = trust || bearer || token || '';
@@ -1652,7 +1690,7 @@ app.post('/sse', async (req, res) => {
 
             // --- new: CHAIN dispatcher ---
             if (name === 'chain') {
-                const chainResults = await runChain(chainId, args);
+                const chainResults = await runChain(chainId, args, isDevAuthorized(req));
                 return res.json({
                     jsonrpc: '2.0',
                     id: jr.id,
@@ -1663,6 +1701,7 @@ app.post('/sse', async (req, res) => {
             }
 
             // --- normal tool dispatch (unchanged) ---
+            assertDevToolsAuthorized(name, isDevAuthorized(req));
             let content;
             if (name === 'query_table') content = await tool_query_table(args);
             else if (name === 'insert_data') content = await tool_insert_data(args);
@@ -1742,7 +1781,7 @@ app.post('/sse', async (req, res) => {
             error: {
                 code: e?.code || -32000,
                 message: e?.message || String(e),
-                data: e?.details || e?.stack || null
+                data: e?.details || (process.env.NODE_ENV !== 'production' ? e?.stack || null : null)
             }
         });
     }
@@ -4496,6 +4535,30 @@ async function resolveHostIPs(host){
   try { const recs = await dns.lookup(host, { all:true }); return recs.map(r=>r.address); }
   catch { return []; }
 }
+
+// dns.lookup-compatible resolver that rejects private/localhost addresses at
+// the exact moment a connection is opened. Passed into an undici Agent as
+// connect.lookup so the address validated is guaranteed to be the address
+// actually connected to — closing the TOCTOU/DNS-rebinding gap that a
+// separate "resolve, check, then fetch (re-resolves)" pattern leaves open.
+function safeLookup(hostname, options, callback) {
+  // Must use the callback-style node:dns API here, not the node:dns/promises
+  // import used elsewhere in this file (`dns`) — passing a callback to the
+  // promise version silently no-ops and undici's connect hook never fires.
+  dnsLookupCallback(hostname, options, (err, address, family) => {
+    if (err) return callback(err);
+    if (BROWSER_DENY_LOCALHOST) {
+      const addrs = Array.isArray(address) ? address.map(a => a.address) : [address];
+      if (addrs.some(isPrivateHost)) {
+        return callback(new Error(`refusing to connect: ${hostname} resolved to a private/localhost IP`));
+      }
+    }
+    callback(null, address, family);
+  });
+}
+// Shared dispatcher for all outbound fetches in tool_http_fetch — pools
+// connections normally when BROWSER_DENY_LOCALHOST is off (pure passthrough).
+const SAFE_FETCH_DISPATCHER = new UndiciAgent({ connect: { lookup: safeLookup } });
 function sameSite(u1,u2){
   try{
     const a=new URL(u1), b=new URL(u2);
@@ -4824,7 +4887,15 @@ async function tool_http_fetch(args){
     if (c?.etag) h['If-None-Match'] = c.etag;
     if (c?.last_modified) h['If-Modified-Since'] = c.last_modified;
   }
-  const token = FETCH_HOST_TOKENS[u.hostname];
+  // Never auto-attach a configured bearer token to our own Supabase project host:
+  // FETCH_HOST_TOKENS can carry a service_role JWT, and the CRUD tools already
+  // provide RLS-enforced (anon key) access to that host — letting http_fetch
+  // attach service_role there would let any caller bypass RLS entirely.
+  const isOwnSupabaseHost = SUPABASE_HOSTNAME && u.hostname === SUPABASE_HOSTNAME;
+  if (isOwnSupabaseHost && FETCH_HOST_TOKENS[u.hostname]) {
+    console.error(`[http_fetch] blocked auto-injected token for own Supabase host ${u.hostname} — use the CRUD tools instead`);
+  }
+  const token = isOwnSupabaseHost ? undefined : FETCH_HOST_TOKENS[u.hostname];
   if (token && !h['Authorization']) h['Authorization'] = token;
 
   let reqBody;
@@ -4846,7 +4917,7 @@ async function tool_http_fetch(args){
 
   try {
     while (true) {
-      const res = await fetch(currentUrl, { method, headers:h, body:reqBody, redirect:'manual', signal: controller.signal });
+      const res = await fetch(currentUrl, { method, headers:h, body:reqBody, redirect:'manual', signal: controller.signal, dispatcher: SAFE_FETCH_DISPATCHER });
       const meta = { ok: res.ok, status: res.status, url: currentUrl, headers: Object.fromEntries(res.headers) };
       lastResMeta = meta;
 
@@ -4881,7 +4952,7 @@ async function tool_http_fetch(args){
         const jitter=Math.floor(Math.random()*FETCH_BACKOFF_JITTER_MS);
         await new Promise(r=>setTimeout(r, FETCH_BACKOFF_BASE_MS * Math.pow(2, attempt)+jitter));
         attempt++;
-        const again = await fetch(currentUrl, { method, headers:h, body:reqBody, redirect:'manual', signal: controller.signal });
+        const again = await fetch(currentUrl, { method, headers:h, body:reqBody, redirect:'manual', signal: controller.signal, dispatcher: SAFE_FETCH_DISPATCHER });
         finalRes = again;
         meta.ok=finalRes.ok; meta.status=finalRes.status; meta.headers=Object.fromEntries(finalRes.headers);
       }
@@ -5589,6 +5660,9 @@ app.get('/gpt/health', (_req, res) => {
  */
 app.post("/edit/perform_safe", async (req, res) => {
     try {
+        if (!isDevAuthorized(req)) {
+            return res.status(403).json({ error: 'Forbidden: dev-tools token required (X-MCP-Dev-Token)' });
+        }
         const { relpath, anchor, new_lines, commit_message } = req.body || {};
         if (!relpath || !anchor || !Array.isArray(new_lines)) {
             return res.status(400).json({ error: "Missing relpath, anchor, or new_lines[]" });
