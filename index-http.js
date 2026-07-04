@@ -345,6 +345,18 @@ const TRUST_TOKEN       = process.env.MCP_TRUST_TOKEN || '';
 const CURSOR_SECRET     = process.env.CURSOR_SIGNING_SECRET || '';
 const SSE_PING_MS       = Number(process.env.MCP_SSE_PING_MS || 15000);
 
+// Constant-time token comparison. Returns false for empty/unset expected
+// values so an unset secret never matches. The length check leaks only the
+// length (unavoidable with timingSafeEqual, which throws on length mismatch),
+// not the byte contents.
+function safeEqual(actual, expected) {
+    if (!expected) return false;
+    const A = Buffer.from(String(actual ?? ''), 'utf8');
+    const B = Buffer.from(String(expected), 'utf8');
+    if (A.length !== B.length) return false;
+    return crypto.timingSafeEqual(A, B);
+}
+
 const LOG_EVENTS        = (process.env.MCP_LOG_EVENTS || '0') === '1';
 const LOG_TABLE_FQTN    = process.env.MCP_LOG_TABLE || ''; // e.g. system.event_log
 
@@ -421,10 +433,16 @@ server.listen(PORT, '127.0.0.1', () => {
 // ✅ JSON + CORS middleware (single setup)
 app.use(express.json({ limit: MAX_JSON_BYTES, type: ['application/json', 'text/plain'] }));
 app.use(express.urlencoded({ limit: MAX_JSON_BYTES, extended: true }));
+// CORS origin is configurable: set MCP_CORS_ORIGINS to a comma-separated
+// allowlist (e.g. "https://claude.ai,https://chat.openai.com") to lock it down.
+// Defaults to '*' to preserve existing connector behavior. Note: auth here is
+// header/token-based, not cookie-based, so '*' does not expose credentialed
+// cross-origin reads — but an allowlist is available if you want it.
+const CORS_ORIGINS = (process.env.MCP_CORS_ORIGINS || '*').trim();
 app.use(cors({
-    origin: '*',
+    origin: CORS_ORIGINS === '*' ? '*' : CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean),
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-MCP-Trust', 'Origin', 'User-Agent'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-MCP-Trust', 'X-MCP-Dev-Token', 'x-mcp-token', 'Origin', 'User-Agent'],
     maxAge: 86400,
 }));
 app.options('*', (_req, res) => res.sendStatus(204));
@@ -457,17 +475,19 @@ app.use((req, res, next) => {
         return next();
     }
 
-    // ✅ Auth: trust header, URL token, or direct localhost (crons bypass nginx)
-    const urlToken = req.query.token || '';
+    // ✅ Auth: trust header, bearer/x-mcp-token header, or direct localhost
+    // (crons bypass nginx). Tokens are read from headers only — never from the
+    // query string, which leaks into access logs, browser history, and Referer.
+    const headerToken = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim() || req.get('x-mcp-token') || '';
     const directLocal = local && !req.get('X-Real-IP');
-    const trustOk = !!process.env.MCP_TRUST_TOKEN && trust === process.env.MCP_TRUST_TOKEN;
-    const tokenOk = !!process.env.MCP_URL_TOKEN && urlToken === process.env.MCP_URL_TOKEN;
+    const trustOk = safeEqual(trust, process.env.MCP_TRUST_TOKEN);
+    const tokenOk = safeEqual(headerToken, process.env.MCP_URL_TOKEN);
     if (trustOk || tokenOk || directLocal) {
         return next();
     }
 
     // ❌ Everything else is blocked
-    console.error('[AUTH BLOCKED]', req.method, req.path, { trust: !!trust, token: !!urlToken });
+    console.error('[AUTH BLOCKED]', req.method, req.path, { trust: !!trust, token: !!headerToken });
     res.status(403).json({ error: 'Forbidden' });
 });
 
@@ -553,17 +573,12 @@ app.post('/oauth/token', express.urlencoded({ extended: true }), (req, res) => {
 
     // Accept if client_secret matches our trust token
     // OR if client_id matches (for flexibility)
-    const isValid = (
-        (clientSecret && clientSecret === validToken) ||
-        (clientId && clientId === validToken)
-    );
+    const isValid = safeEqual(clientSecret, validToken) || safeEqual(clientId, validToken);
 
     if (!isValid) {
         console.error('[OAuth /token] Invalid credentials', {
             clientIdProvided: !!clientId,
-            clientSecretProvided: !!clientSecret,
-            clientSecretMatch: clientSecret === validToken,
-            clientIdMatch: clientId === validToken
+            clientSecretProvided: !!clientSecret
         });
         return res.status(401).json({
             error: 'invalid_client',
@@ -826,7 +841,7 @@ const DEV_TOOLS = new Set([
 ]);
 function isDevAuthorized(req) {
     const token = req?.get?.('X-MCP-Dev-Token') || '';
-    return !!process.env.MCP_DEV_TOOLS_TOKEN && token === process.env.MCP_DEV_TOOLS_TOKEN;
+    return safeEqual(token, process.env.MCP_DEV_TOOLS_TOKEN);
 }
 function assertDevToolsAuthorized(name, devAuthorized) {
     if (DEV_TOOLS.has(name) && !devAuthorized) {
@@ -1434,13 +1449,9 @@ app.get('/CRUD.json', (_req, res) =>
 /* ========================= /sse auth + rate limit ========================= */
 function isTrustedClient(req) {
   const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
-    const got = req.get('X-MCP-Trust') || req.query.trust || '';
-  const origin = req.get('origin') || '';
+  const got = req.get('X-MCP-Trust') || '';
 
-  return (
-    (process.env.MCP_URL_TOKEN && bearer === process.env.MCP_URL_TOKEN) ||
-    (TRUST_TOKEN && got === TRUST_TOKEN)
-  );
+  return safeEqual(bearer, process.env.MCP_URL_TOKEN) || safeEqual(got, TRUST_TOKEN);
 }
 
 // ── Auth gate for /sse ─────────────────────────────────────────────
@@ -1464,19 +1475,20 @@ app.use('/sse', (req, res, next) => {
     const localIp = req.ip === '127.0.0.1' || req.ip === '::1';
     if (localIp && !req.get('X-Real-IP')) return next();
 
-    // collect creds from all supported places
+    // collect creds from headers only (never query string — it leaks into
+    // access logs, browser history, and Referer)
     const bearerRaw = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
-    const urlTok = req.query.token || req.get('x-mcp-token') || '';
+    const urlTok = req.get('x-mcp-token') || '';
     const trustHdr = req.get('X-MCP-Trust') || '';
-    const trustQ = req.query.trust || '';
 
     const bearer = normalize(bearerRaw);
     const token = normalize(urlTok);
-    const trust = normalize(trustHdr || trustQ);
+    const trust = normalize(trustHdr);
 
     const ok =
-        (expectedTrust && trust && trust === expectedTrust) ||
-        (expectedBearer && ((bearer && bearer === expectedBearer) || (token && token === expectedBearer)));
+        safeEqual(trust, expectedTrust) ||
+        safeEqual(bearer, expectedBearer) ||
+        safeEqual(token, expectedBearer);
 
     if (!ok) {
         const got = trust || bearer || token || '';
