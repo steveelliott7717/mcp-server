@@ -41,6 +41,17 @@ const logger = pino({
 
 const UPLOAD_DIR = '/tmp/mcp-uploads';
 
+// Resolve `rel` against `base` and require the result to stay inside `base`.
+// A bare startsWith(base) check would also match sibling directories like
+// `${base}-evil`; comparing against base + path.sep closes that hole.
+function resolveUnder(base, rel) {
+    const p = path.resolve(base, rel || '');
+    if (p !== base && !p.startsWith(base + path.sep)) {
+        throw new Error(`Path not allowed outside ${base}`);
+    }
+    return p;
+}
+
 
 // --- Gmail Token Auto-Injector ---
 async function maybeInjectGmailToken(args) {
@@ -893,9 +904,6 @@ async function callOneToolByName(name, args, devAuthorized = false) {
     else if (name === 'poshmark_post_comment') return tool_poshmark_post_comment(args);
     else if (name === 'poshmark_get_listing') return tool_poshmark_get_listing(args);
     else if (name === 'browser_flow') return tool_browser_flow(args);
-    else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
-        return tool_finalize_verification(args);
-    else if (name === 'enforce_mapping') return tool_enforce_mapping(args);
     else if (name === 'chain') {
         const chainId = crypto.randomUUID?.() || Math.random().toString(36).slice(2);
         return asJsonContent(await runChain(chainId, args, devAuthorized));
@@ -1017,10 +1025,7 @@ async function tool_get_file({ filename }) {
 // Find a string anchor in a file and return surrounding context
 async function tool_find_anchor({ relpath, anchor, context_lines = 20 }) {
     const SAFE_BASE = "/opt/supabase-mcp/runtime";
-    const filePath = path.join(SAFE_BASE, relpath);
-
-    if (!filePath.startsWith(SAFE_BASE))
-        throw new Error(`Path not allowed outside ${SAFE_BASE}`);
+    const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const text = await fsp.readFile(filePath, "utf8");
     const lines = text.split(/\r?\n/);
@@ -1045,11 +1050,7 @@ async function tool_find_anchor({ relpath, anchor, context_lines = 20 }) {
 // 🧩 Retrieve the full definition of a function by matching braces
 async function tool_get_anchor_function_definition({ relpath, anchor }) {
     const SAFE_BASE = "/opt/supabase-mcp/runtime";
-    const filePath = path.join(SAFE_BASE, relpath);
-
-    if (!filePath.startsWith(SAFE_BASE)) {
-        throw new Error(`Path not allowed outside ${SAFE_BASE}`);
-    }
+    const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const text = await fsp.readFile(filePath, "utf8");
     const startIdx = text.indexOf(anchor);
@@ -1094,10 +1095,7 @@ async function tool_get_anchor_function_definition({ relpath, anchor }) {
 // Atomically replace a section of a file by line range, with backup
 async function tool_edit_slice({ relpath, start_line, end_line, new_lines }) {
     const SAFE_BASE = "/opt/supabase-mcp/runtime";
-    const filePath = path.join(SAFE_BASE, relpath);
-    if (!filePath.startsWith(SAFE_BASE)) {
-        throw new Error(`Path not allowed outside ${SAFE_BASE}`);
-    }
+    const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const text = await fsp.readFile(filePath, "utf8");
     const lines = text.split(/\r?\n/);
@@ -1137,8 +1135,7 @@ async function tool_edit_slice({ relpath, start_line, end_line, new_lines }) {
 async function tool_run_check({ relpath }) {
     const SAFE_BASE = "/opt/supabase-mcp/runtime";
     if (!relpath) throw new Error("relpath is required");
-    const target = path.join(SAFE_BASE, relpath);
-    if (!target.startsWith(SAFE_BASE)) throw new Error(`Path not allowed outside ${SAFE_BASE}`);
+    const target = resolveUnder(SAFE_BASE, relpath);
 
     const { execFile } = await import("child_process");
     return await new Promise((resolve) => {
@@ -1164,17 +1161,15 @@ async function tool_run_check({ relpath }) {
 // Restore the most recent .bak backup for a file
 async function tool_revert_file({ relpath, backup }) {
     const SAFE_BASE = "/opt/supabase-mcp/runtime";
-    const filePath = path.join(SAFE_BASE, relpath);
-    if (!filePath.startsWith(SAFE_BASE)) {
-        throw new Error(`Path not allowed outside ${SAFE_BASE}`);
-    }
+    const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const dir = path.dirname(filePath);
     const base = path.basename(filePath);
     let backupPath;
 
     if (backup) {
-        backupPath = path.join(dir, backup);
+        // backup is caller-supplied — keep it inside the target's directory
+        backupPath = resolveUnder(dir, backup);
     } else {
         // Find latest backup automatically
         const candidates = fs.readdirSync(dir)
@@ -1197,8 +1192,7 @@ async function tool_revert_file({ relpath, backup }) {
 // Simulate a file edit and return a unified diff (no write)
 async function tool_dry_run_edit({ relpath, start_line, end_line, new_lines }) {
     const SAFE_BASE = "/opt/supabase-mcp/runtime";
-    const filePath = path.join(SAFE_BASE, relpath);
-    if (!filePath.startsWith(SAFE_BASE)) throw new Error(`Path not allowed outside ${SAFE_BASE}`);
+    const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const text = await fsp.readFile(filePath, "utf8");
     const lines = text.split(/\r?\n/);
@@ -1443,13 +1437,17 @@ function nlAllowed(chainId, text) {
 
 
 /* ========================= OpenAPI export ========================= */
-app.get('/openapi.json', (_req, res) =>
-    res.sendFile(path.join(__dirname, 'openapi.json'))
-);
+app.get('/openapi.json', (_req, res) => {
+    const f = path.join(__dirname, 'openapi.json');
+    if (!fs.existsSync(f)) return res.status(404).json({ error: 'openapi.json not found' });
+    res.sendFile(f);
+});
 
-app.get('/CRUD.json', (_req, res) =>
-    res.sendFile(path.join(process.cwd(), 'CRUD.json'))
-);
+app.get('/CRUD.json', (_req, res) => {
+    const f = path.join(process.cwd(), 'CRUD.json');
+    if (!fs.existsSync(f)) return res.status(404).json({ error: 'CRUD.json not found' });
+    res.sendFile(f);
+});
 
 
 
@@ -1742,9 +1740,6 @@ app.post('/sse', async (req, res) => {
             else if (name === 'poshmark_post_comment') content = await tool_poshmark_post_comment(args);
             else if (name === 'poshmark_get_listing') content = await tool_poshmark_get_listing(args);
             else if (name === 'browser_flow') content = await tool_browser_flow(args);
-            else if (name === 'finalize_verification' && typeof tool_finalize_verification === 'function')
-                content = await tool_finalize_verification(args);
-            else if (name === 'enforce_mapping') content = await tool_enforce_mapping(args);
             else if (name === 'rpc_expose_constraints_filtered') {
                 const { target_schema, target_table } = args;
                 const { data, error } = await supabase.rpc('rpc_expose_constraints_filtered', {
@@ -2206,17 +2201,6 @@ function toolsPayload(){
         count:{type:'string', enum:['none','exact','planned','estimated']}
       }, required:['table','where'] } },
 
-{ name:'finalize_verification', description:'Flip speak-gate after final verification has succeeded', inputSchema:{
-  type:'object',
-  additionalProperties: true,
-  properties:{
-    chain:{type:'string'}, // optional: explicit chain id if you don't want header
-    summary_rows:{type:'number', description:'Number of rows updated to report in final NL'}
-  }, required:[]
-}},
-
-
-
     { name:'list_schemas', description:'List allowed schemas (RPC with env allowlist fallback)', inputSchema:{
       type:'object',
       additionalProperties: true,
@@ -2645,15 +2629,12 @@ function toolsPayload(){
 async function tool_encode_attachment({ filePath, encoding = 'base64url' }) {
     if (!filePath) throw new Error('Missing filePath');
 
-    // Resolve path: absolute or relative to uploads directory
-    let resolvedPath = filePath;
-    if (!path.isAbsolute(filePath)) {
-        resolvedPath = path.join(UPLOAD_DIR, filePath);
-    }
-
-    // Safety: ensure it doesn't escape upload dir
-    const normalized = path.normalize(resolvedPath);
-    if (!normalized.startsWith(UPLOAD_DIR)) {
+    // Resolve path (absolute or relative to uploads directory) and ensure it
+    // doesn't escape the upload dir — including sibling dirs like /tmp/mcp-uploadsX
+    let normalized;
+    try {
+        normalized = resolveUnder(UPLOAD_DIR, filePath);
+    } catch {
         throw new Error(`Unsafe file path outside uploads directory: ${filePath}`);
     }
 
@@ -3700,6 +3681,13 @@ async function tool_delete_data(args) {
 //////////////////////////////
 // Discovery: list_* tools
 //////////////////////////////
+// Fallback schema list when the list_schemas RPC is unavailable.
+// Override with MCP_ALLOWED_SCHEMAS (comma-separated).
+function parseAllowedSchemas(){
+  const env=(process.env.MCP_ALLOWED_SCHEMAS||'').split(',').map(s=>s.trim()).filter(Boolean);
+  if(env.length) return env;
+  return ['public','gmail','calendar','health','finance','professional_profile','genealogy'];
+}
 async function tool_list_schemas(){
   try{
     const {data,error}=await supabase.rpc('list_schemas');
@@ -4992,7 +4980,8 @@ async function tool_http_fetch(args){
         if (et || lm) { __fetchCache.set(currentUrl, { etag:et, last_modified:lm }); capMap(__fetchCache, 500); }
       }
 
-        // ✅ Read body with Node-compatible fallback
+        // ✅ Read body as raw bytes (never via .text(), which decodes as UTF-8
+        // and corrupts binary responses) with max_bytes enforced while streaming
         let bytes;
         {
             const maxB = max_bytes || FETCH_MAX_BYTES_DEFAULT;
@@ -5000,36 +4989,41 @@ async function tool_http_fetch(args){
             let readBytes = 0;
 
             try {
-                // If running in Node (ReadableStream or polyfilled fetch)
-                if (typeof finalRes.text === "function") {
-                    const text = await finalRes.text();
-                    bytes = Buffer.from(text, "utf-8");
-                    readBytes = bytes.length;
+                const bodyStream = finalRes.body;
+                if (!bodyStream) {
+                    bytes = Buffer.alloc(0);
                 }
-                // If running in environments where body is an async iterable (Node fetch)
-                else if (finalRes.body && typeof finalRes.body[Symbol.asyncIterator] === "function") {
-                    for await (const chunk of finalRes.body) {
-                        readBytes += chunk.length;
-                        if (maxB && readBytes > maxB)
-                            throw new Error(`max_bytes exceeded (${readBytes})`);
-                        chunks.push(chunk);
-                    }
-                    bytes = Buffer.concat(chunks);
-                }
-                // If running in Deno / browser-like environment
-                else if (finalRes.body && typeof finalRes.body.getReader === "function") {
-                    const reader = finalRes.body.getReader();
+                // Web ReadableStream (Node fetch / undici, Deno, browsers)
+                else if (typeof bodyStream.getReader === "function") {
+                    const reader = bodyStream.getReader();
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) break;
                         readBytes += value.byteLength;
+                        if (maxB && readBytes > maxB) {
+                            try { await reader.cancel(); } catch {}
+                            throw new Error(`max_bytes exceeded (${readBytes})`);
+                        }
+                        chunks.push(Buffer.from(value));
+                    }
+                    bytes = Buffer.concat(chunks);
+                }
+                // Async-iterable body (node streams)
+                else if (typeof bodyStream[Symbol.asyncIterator] === "function") {
+                    for await (const chunk of bodyStream) {
+                        readBytes += chunk.length;
                         if (maxB && readBytes > maxB)
                             throw new Error(`max_bytes exceeded (${readBytes})`);
-                        chunks.push(value);
+                        chunks.push(Buffer.from(chunk));
                     }
-                    bytes = Buffer.concat(chunks.map((c) => Buffer.from(c)));
-                } else {
-                    throw new Error("Unsupported response body type");
+                    bytes = Buffer.concat(chunks);
+                }
+                // Last resort: buffer whole body, then enforce the clamp
+                else {
+                    bytes = Buffer.from(await finalRes.arrayBuffer());
+                    readBytes = bytes.length;
+                    if (maxB && readBytes > maxB)
+                        throw new Error(`max_bytes exceeded (${readBytes})`);
                 }
             } catch (err) {
                 throw new Error(`Failed to read response body: ${err.message}`);
@@ -5773,7 +5767,7 @@ app.post(['/health/steps', '/shortcuts/steps'], async (req, res) => {
 
         // Only enforce token if HEALTHKIT_INGEST_TOKEN is set
         if (HEALTHKIT_INGEST_TOKEN) {
-            if (!token || token !== HEALTHKIT_INGEST_TOKEN) {
+            if (!safeEqual(token, HEALTHKIT_INGEST_TOKEN)) {
                 return res.status(401).json({ error: 'Invalid token' });
             }
         }
@@ -5849,7 +5843,7 @@ app.post(['/health/steps_agg', '/shortcuts/steps_agg'], async (req, res) => {
         const auth = (req.get('authorization') || '').trim();
         const token = auth.replace(/^Bearer\s+/i, '');
 
-        if (HEALTHKIT_INGEST_TOKEN && token !== HEALTHKIT_INGEST_TOKEN) {
+        if (HEALTHKIT_INGEST_TOKEN && !safeEqual(token, HEALTHKIT_INGEST_TOKEN)) {
             return res.status(401).json({ error: 'Invalid token' });
         }
 
