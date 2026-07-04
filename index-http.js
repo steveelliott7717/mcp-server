@@ -475,14 +475,21 @@ app.use((req, res, next) => {
         return next();
     }
 
-    // ✅ Auth: trust header, bearer/x-mcp-token header, or direct localhost
-    // (crons bypass nginx). Tokens are read from headers only — never from the
-    // query string, which leaks into access logs, browser history, and Referer.
-    const headerToken = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim() || req.get('x-mcp-token') || '';
+    // ✅ Auth: trust header/query, bearer/x-mcp-token header, URL token, or
+    // direct localhost (crons bypass nginx). Query-string tokens are supported
+    // because remote MCP/SSE connectors pass auth in the URL; nginx is
+    // configured to mask them out of access logs (see mcp.conf).
+    const headerToken = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim()
+        || req.get('x-mcp-token') || req.query.token || '';
+    const trustVal = trust || req.query.trust || '';
     const directLocal = local && !req.get('X-Real-IP');
-    const trustOk = safeEqual(trust, process.env.MCP_TRUST_TOKEN);
-    const tokenOk = safeEqual(headerToken, process.env.MCP_URL_TOKEN);
-    if (trustOk || tokenOk || directLocal) {
+    // Accept either master secret presented via any channel. Both MCP_TRUST_TOKEN
+    // and MCP_URL_TOKEN grant full access, and the OAuth endpoint issues
+    // MCP_TRUST_TOKEN as the bearer, so a bearer/token may legitimately equal
+    // either one (query ?token= connector config OR an OAuth reconnect).
+    const authed = [headerToken, trustVal].some(v =>
+        safeEqual(v, process.env.MCP_TRUST_TOKEN) || safeEqual(v, process.env.MCP_URL_TOKEN));
+    if (authed || directLocal) {
         return next();
     }
 
@@ -1449,9 +1456,12 @@ app.get('/CRUD.json', (_req, res) =>
 /* ========================= /sse auth + rate limit ========================= */
 function isTrustedClient(req) {
   const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
-  const got = req.get('X-MCP-Trust') || '';
+  const got = req.get('X-MCP-Trust') || req.query.trust || '';
+  const qtok = req.query.token || '';
 
-  return safeEqual(bearer, process.env.MCP_URL_TOKEN) || safeEqual(got, TRUST_TOKEN);
+  return safeEqual(bearer, process.env.MCP_URL_TOKEN)
+      || safeEqual(qtok, process.env.MCP_URL_TOKEN)
+      || safeEqual(got, TRUST_TOKEN);
 }
 
 // ── Auth gate for /sse ─────────────────────────────────────────────
@@ -1475,20 +1485,20 @@ app.use('/sse', (req, res, next) => {
     const localIp = req.ip === '127.0.0.1' || req.ip === '::1';
     if (localIp && !req.get('X-Real-IP')) return next();
 
-    // collect creds from headers only (never query string — it leaks into
-    // access logs, browser history, and Referer)
+    // collect creds from headers or query string (remote SSE connectors pass
+    // auth in the URL; nginx masks the token out of access logs — see mcp.conf)
     const bearerRaw = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
-    const urlTok = req.get('x-mcp-token') || '';
-    const trustHdr = req.get('X-MCP-Trust') || '';
+    const urlTok = req.get('x-mcp-token') || req.query.token || '';
+    const trustHdr = req.get('X-MCP-Trust') || req.query.trust || '';
 
     const bearer = normalize(bearerRaw);
     const token = normalize(urlTok);
     const trust = normalize(trustHdr);
 
-    const ok =
-        safeEqual(trust, expectedTrust) ||
-        safeEqual(bearer, expectedBearer) ||
-        safeEqual(token, expectedBearer);
+    // Accept either master secret via any channel (see global gate rationale):
+    // bearer may be the OAuth-issued MCP_TRUST_TOKEN, or the ?token= URL token.
+    const ok = [trust, bearer, token].some(v =>
+        safeEqual(v, expectedTrust) || safeEqual(v, expectedBearer));
 
     if (!ok) {
         const got = trust || bearer || token || '';
