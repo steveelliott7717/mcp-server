@@ -6,8 +6,8 @@
  * - Playwright browser flows (multi-step, stealth-ish, context, session, uploads, screenshots, PDFs, extract, jitter)
  * - Notify push (webhook + destinations)
  *
- * Concatenate parts 1–4 into a single file named: /opt/supabase-mcp/runtime/index-http.js
- *   cat index-http-part1.txt index-http-part2.txt index-http-part3.txt index-http-part4.txt > index-http.js
+ * Deployed tree: /opt/supabase-mcp/custom (systemd runs index-http.js from here;
+ * the "PART n/4" banners below are historical — this is one file now).
  */
 // Use Duffel, not Amadeus or aviaflight
 import dotenv from 'dotenv';
@@ -426,6 +426,13 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ESM-safe __dirname for sendFile, etc.
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
+
+// Base directory for the runtime source-editing dev tools (tool_edit_slice,
+// tool_run_check, tool_commit_file, ...). This must be the deployed,
+// git-managed tree the service actually runs from — historically these tools
+// pointed at /opt/supabase-mcp/runtime, which is neither (it holds only
+// rotated logs and is not a git repo), so edits landed in a dead tree.
+const DEV_TOOLS_BASE = process.env.MCP_DEV_TOOLS_BASE || __dirname;
 
 // ── JSON/body size & parsers (single block; remove duplicates below) ──────────
 const MAX_JSON_BYTES = process.env.MCP_JSON_LIMIT || '5mb';
@@ -1024,7 +1031,7 @@ async function tool_get_file({ filename }) {
 // ==========================================================
 // Find a string anchor in a file and return surrounding context
 async function tool_find_anchor({ relpath, anchor, context_lines = 20 }) {
-    const SAFE_BASE = "/opt/supabase-mcp/runtime";
+    const SAFE_BASE = DEV_TOOLS_BASE;
     const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const text = await fsp.readFile(filePath, "utf8");
@@ -1049,7 +1056,7 @@ async function tool_find_anchor({ relpath, anchor, context_lines = 20 }) {
 
 // 🧩 Retrieve the full definition of a function by matching braces
 async function tool_get_anchor_function_definition({ relpath, anchor }) {
-    const SAFE_BASE = "/opt/supabase-mcp/runtime";
+    const SAFE_BASE = DEV_TOOLS_BASE;
     const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const text = await fsp.readFile(filePath, "utf8");
@@ -1094,7 +1101,7 @@ async function tool_get_anchor_function_definition({ relpath, anchor }) {
 //////////////////////////////
 // Atomically replace a section of a file by line range, with backup
 async function tool_edit_slice({ relpath, start_line, end_line, new_lines }) {
-    const SAFE_BASE = "/opt/supabase-mcp/runtime";
+    const SAFE_BASE = DEV_TOOLS_BASE;
     const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const text = await fsp.readFile(filePath, "utf8");
@@ -1133,7 +1140,7 @@ async function tool_edit_slice({ relpath, start_line, end_line, new_lines }) {
 // No caller-controlled command: always `node --check <relpath>` under
 // SAFE_BASE, invoked via execFile (no shell) so nothing here is injectable.
 async function tool_run_check({ relpath }) {
-    const SAFE_BASE = "/opt/supabase-mcp/runtime";
+    const SAFE_BASE = DEV_TOOLS_BASE;
     if (!relpath) throw new Error("relpath is required");
     const target = resolveUnder(SAFE_BASE, relpath);
 
@@ -1160,7 +1167,7 @@ async function tool_run_check({ relpath }) {
 //////////////////////////////
 // Restore the most recent .bak backup for a file
 async function tool_revert_file({ relpath, backup }) {
-    const SAFE_BASE = "/opt/supabase-mcp/runtime";
+    const SAFE_BASE = DEV_TOOLS_BASE;
     const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const dir = path.dirname(filePath);
@@ -1191,7 +1198,7 @@ async function tool_revert_file({ relpath, backup }) {
 //////////////////////////////
 // Simulate a file edit and return a unified diff (no write)
 async function tool_dry_run_edit({ relpath, start_line, end_line, new_lines }) {
-    const SAFE_BASE = "/opt/supabase-mcp/runtime";
+    const SAFE_BASE = DEV_TOOLS_BASE;
     const filePath = resolveUnder(SAFE_BASE, relpath);
 
     const text = await fsp.readFile(filePath, "utf8");
@@ -1239,7 +1246,7 @@ function generateUnifiedDiff(oldText, newText, fileName = "file") {
 // Commit and push file changes to Git (GitHub-safe)
 async function tool_commit_file({ relpath, message = "Automated MCP edit" }) {
     const { execFile } = await import("child_process");
-    const cwd = "/opt/supabase-mcp/runtime";
+    const cwd = DEV_TOOLS_BASE;
     const safeRel = relpath.replace(/[^a-zA-Z0-9._/-]/g, "");
 
     const run = (cmd, args) => new Promise((resolve, reject) => {
@@ -2123,7 +2130,7 @@ async function logEventRow(action, fqtn, durationMs, rowsAffected){
 ================================================================== */
 /**
  * MCP Supabase HTTP Server — Extended (PART 2/4)
- * Concatenate parts 1–4 into: /opt/supabase-mcp/runtime/index-http.js
+ * (historical banner — single file now, deployed at /opt/supabase-mcp/custom)
  *   cat index-http-part1.txt index-http-part2.txt index-http-part3.txt index-http-part4.txt > index-http.js
  *
  * This part defines:
@@ -3187,8 +3194,7 @@ async function tool_update_data(args) {
             expand,
             count,
             // Keys / options
-            pk,                 // string | string[]  (required for per-row multi-update)
-            upsert_on_conflict  // string[] | string (optional; defaults to pk if provided)
+            pk                  // string | string[]  (required for per-row multi-update)
         } = args || {};
 
         const { schema, table } = parseTable(tArg, sArg);
@@ -3374,7 +3380,7 @@ async function tool_update_data(args) {
             }
         }
 
-        // Helper to apply the patch to a single row scope, with verification and optional upsert fallback
+        // Helper to apply the patch to a single row scope, with post-write verification
         async function updateOne(pkeyValues, baseRow) {
             // Resolve math ops using baseRow when available
             const patch = {};
@@ -3413,93 +3419,51 @@ async function tool_update_data(args) {
             const r = await execOrThrow(q);
             let rows = r?.data ?? [];
 
-            // Deterministic verification by PK(s) when available
+            // Deterministic verification by PK(s) when available. On mismatch this
+            // throws — it must never fall back to an upsert, which could insert a
+            // row the update didn't match (e.g. resurrecting a deleted row).
             const pkWhere = pkCols.length ? (pkeyValues || buildPkWhere(where)) : null;
-            let verified = false;
             if (pkWhere) {
-            const proj = await execOrThrow(
-                supabase.schema(schema).from(table).select("*").match(pkWhere)
-            );
-            const got = proj?.data ?? [];
-            if (got.length === 1) {
-                const g = got[0];
-                verified = Object.entries(patch).every(([k, v]) => {
-                    if (k === "updated_at" || k === "created_at") return true;
-                    if (v && typeof v === "object") return true;
-                    if (v === null || v === undefined) return g[k] === null || g[k] === undefined;
-                    const dbVal = g[k];
-                    if (dbVal === v) return true;
-                    if (typeof v === "string" && typeof dbVal === "string" && dbVal.startsWith(v)) return true;
-                    try { const dA = new Date(dbVal), dB = new Date(v); if (!isNaN(dA) && !isNaN(dB) && dA.getTime() === dB.getTime()) return true; } catch {}
-                    return String(dbVal) === String(v);
-                });
-                rows = got;
-            }
-            } else {
-            verified = Array.isArray(rows) && rows.length > 0;
-            }
-
-            // Fallback: upsert if not verified
-            if (!verified) {
-            const conflictCols = upsert_on_conflict
-                ? (Array.isArray(upsert_on_conflict) ? upsert_on_conflict : [upsert_on_conflict])
-                : pkCols;
-
-            if (conflictCols.length) {
-                // SAFETY: never upsert without valid PK values — would cause full-table update
-                if (!pkWhere || conflictCols.some(c => pkWhere[c] == null)) {
-                    throw new Error(
-                        `SAFETY_VIOLATION: upsert fallback aborted — missing PK values in pkWhere. ` +
-                        `pkWhere=${JSON.stringify(pkWhere)}, conflictCols=${JSON.stringify(conflictCols)}`
-                    );
-                }
-                const upsertRec = { ...patch, ...(pkWhere || {}) };
-                const u = await execOrThrow(
-                supabase
-                    .schema(schema)
-                    .from(table)
-                    .upsert(upsertRec, { onConflict: conflictCols.join(",") })
-                    .select()
-                );
-                let urows = u?.data ?? [];
-
-                if (pkWhere) {
-                const proj2 = await execOrThrow(
+                const proj = await execOrThrow(
                     supabase.schema(schema).from(table).select("*").match(pkWhere)
                 );
-                urows = proj2?.data ?? urows;
-                const g2 = (proj2?.data ?? [])[0];
-                verified = !!g2 && Object.entries(patch).every(([k, v]) => {
-                    if (k === "updated_at" || k === "created_at") return true;
-                    if (v && typeof v === "object") return true;
-                    if (v === null || v === undefined) return g2[k] === null || g2[k] === undefined;
-                    const dbVal = g2[k];
-                    if (dbVal === v) return true;
-                    if (typeof v === "string" && typeof dbVal === "string" && dbVal.startsWith(v)) return true;
-                    try { const dA = new Date(dbVal), dB = new Date(v); if (!isNaN(dA) && !isNaN(dB) && dA.getTime() === dB.getTime()) return true; } catch {}
-                    return String(dbVal) === String(v);
-                });
-                } else {
-                verified = Array.isArray(urows) && urows.length > 0;
+                const got = proj?.data ?? [];
+                if (!got.length) {
+                    if (rows.length) {
+                        throw structuredError("verify_failed", {
+                            tool: "update_data",
+                            table: fqtn,
+                            pkWhere,
+                            patch,
+                            reason: "updated rows not found on re-select"
+                        });
+                    }
+                    // Target row doesn't exist: a 0-row update, not an error
+                    return [];
                 }
-
-                if (!verified) {
-                throw structuredError("verify_failed", {
-                    tool: "update_data",
-                    table: fqtn,
-                    pkWhere: pkWhere || where,
-                    patch
-                });
+                if (got.length === 1) {
+                    const g = got[0];
+                    const verified = Object.entries(patch).every(([k, v]) => {
+                        if (k === "updated_at" || k === "created_at") return true;
+                        if (v && typeof v === "object") return true;
+                        if (v === null || v === undefined) return g[k] === null || g[k] === undefined;
+                        const dbVal = g[k];
+                        if (dbVal === v) return true;
+                        // Timestamps may come back normalized; compare as instants
+                        try { const dA = new Date(dbVal), dB = new Date(v); if (!isNaN(dA) && !isNaN(dB) && dA.getTime() === dB.getTime()) return true; } catch {}
+                        return String(dbVal) === String(v);
+                    });
+                    if (!verified) {
+                        throw structuredError("verify_failed", {
+                            tool: "update_data",
+                            table: fqtn,
+                            pkWhere,
+                            patch,
+                            reason: "row values do not match patch after update"
+                        });
+                    }
+                    rows = got;
                 }
-                return urows;
-            } else {
-                throw structuredError("verify_failed_no_conflict_keys", {
-                tool: "update_data",
-                table: fqtn,
-                pkWhere: pkWhere || where,
-                patch
-                });
-            }
             }
 
             return rows;
@@ -4482,7 +4446,7 @@ Steve Elliott
 ================================================================== */
 /**
  * MCP Supabase HTTP Server — Extended (PART 3/4, Completed)
- * Concatenate parts 1–4 into: /opt/supabase-mcp/runtime/index-http.js
+ * (historical banner — single file now, deployed at /opt/supabase-mcp/custom)
  *
  * This part implements the Advanced HTTP Fetch adapter:
  *  - Per-host token bucket rate limiting
@@ -5085,7 +5049,7 @@ async function tool_http_fetch(args){
 ================================================================== */
 /**
  * MCP Supabase HTTP Server — Extended (PART 4/4, Completed)
- * Concatenate parts 1–4 into: /opt/supabase-mcp/runtime/index-http.js
+ * (historical banner — single file now, deployed at /opt/supabase-mcp/custom)
  *
  * This part implements:
  *  - notify_push tool (Slack, Pushover, generic webhook + destinations)
