@@ -10,3 +10,4 @@ poshmark/login_error.png
 wg/session.json
 wg/*.png
 wg_messages_rows.json
+*.bak-*
