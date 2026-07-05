@@ -487,8 +487,11 @@ app.use((req, res, next) => {
     const trust = req.get('X-MCP-Trust');
     const local = req.ip === '127.0.0.1' || req.ip === '::1';
 
-    // ✅ Public routes — no auth needed
-    if (req.path.startsWith('/sse-readonly') || req.path.startsWith('/tools') ||
+    // ✅ Public routes — no auth needed. Note: /tools is intentionally NOT
+    // public — it returns the full tool catalog+schemas (a capability map for
+    // an attacker). Authenticated clients still get it via GET /tools (they
+    // pass the gate) or, normally, tools/list over /sse.
+    if (req.path.startsWith('/sse-readonly') ||
         req.path === '/health' || req.path === '/gpt/health') {
         return next();
     }
@@ -1549,6 +1552,23 @@ app.use('/sse', (req, res, next) => {
         sseLimiter(req, res, next);
     });
 
+});
+
+// /sse-readonly is publicly reachable (no token) and each query hits the DB
+// with the service-role client, so cap anonymous request volume to blunt
+// scraping / DoS. Local cron calls bypass.
+const readonlyLimiter = rateLimit({
+  windowMs: 10_000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.ip ?? req.socket?.remoteAddress ?? ''),
+  message: { error: 'Too many requests, slow down.' }
+});
+app.use('/sse-readonly', (req, res, next) => {
+    const localDirect = (req.ip === '127.0.0.1' || req.ip === '::1') && !req.get('X-Real-IP');
+    if (localDirect) return next();
+    readonlyLimiter(req, res, next);
 });
 
 /* ===================== JSON-RPC helpers =================== */
@@ -5967,6 +5987,13 @@ async function buildGmailMime({ to, from, subject, bodyText, bodyHtml = null, at
 
 
 app.post('/nl-command', async (req, res) => {
+    // Disabled by default. This is a large, redundant full-power surface — it
+    // sends email and reads/searches Gmail via regex NL parsing, duplicating
+    // capability already in the /sse tool dispatcher, and it has no callers in
+    // the repo. Set MCP_ENABLE_NL_COMMAND=1 to re-enable if you actually use it.
+    if ((process.env.MCP_ENABLE_NL_COMMAND || '0') !== '1') {
+        return res.status(404).json({ error: 'Not found' });
+    }
     try {
         const text = (req.body?.text || '').trim().toLowerCase();
         console.log('[NL COMMAND]', text);
