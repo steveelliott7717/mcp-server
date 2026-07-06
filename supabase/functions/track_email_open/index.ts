@@ -16,38 +16,55 @@ serve(async (req) => {
   });
 
   const now = new Date().toISOString();
+  const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
   console.log("🟢 Processing pixel for tag:", tag);
 
   try {
-    // Mark opened_at on first open
-    const { error: emailError } = await client
-      .from("all_emails")
-      .update({ opened_at: now, updated_at: now })
-      .eq("tracked_tag", tag)
-      .is("opened_at", null);
-
-    if (emailError) {
-      console.error("❌ all_emails update failed:", emailError);
-    }
-
-    // Increment open_count
+    // --- Read current state ---
     const { data: rows, error: fetchError } = await client
       .from("all_emails")
-      .select("open_count")
+      .select("open_count, opened_at, opened_at_2, opened_at_3")
       .eq("tracked_tag", tag)
       .limit(1);
 
-    if (!fetchError && rows?.length) {
-      const currentCount = rows[0].open_count || 0;
-      const { error: incError } = await client
+    if (fetchError || !rows?.length) {
+      console.log("ℹ️ Could not read row (tag missing):", tag);
+    } else {
+      const row = rows[0];
+      const currentCount = row.open_count || 0;
+      const patch: Record<string, unknown> = { updated_at: now };
+
+      // --- Mark opened_at_1/2/3 in order, each written only once ---
+      if (!row.opened_at) {
+        patch.opened_at = now;
+        console.log("✅ Set opened_at for:", tag);
+      } else if (!row.opened_at_2) {
+        patch.opened_at_2 = now;
+        console.log("✅ Set opened_at_2 for:", tag);
+      } else if (!row.opened_at_3) {
+        patch.opened_at_3 = now;
+        console.log("✅ Set opened_at_3 for:", tag);
+      }
+
+      // --- Increment open_count (deduplicated: max once per 30 min, cap at 20) ---
+      // Use most recent open timestamp, not updated_at (which changes on every write)
+      const lastOpen = row.opened_at_3 || row.opened_at_2 || row.opened_at || "";
+      if (currentCount < 20 && lastOpen < thirtyMinAgo) {
+        patch.open_count = currentCount + 1;
+        console.log("🔢 Incremented open_count to", currentCount + 1, "for:", tag);
+      } else {
+        console.log("⏭️ Skipped increment (within 30min window or cap reached) for:", tag);
+      }
+
+      const { error: updateError } = await client
         .from("all_emails")
-        .update({ open_count: currentCount + 1, updated_at: now })
+        .update(patch)
         .eq("tracked_tag", tag);
 
-      if (incError) console.error("⚠️ Increment failed:", incError);
+      if (updateError) console.error("❌ all_emails update failed:", updateError);
     }
 
-    // Also mark sent_emails if present
+    // --- Also mark sent_emails if present ---
     const { error: sentError } = await client
       .from("sent_emails")
       .update({ opened_at: now })
@@ -60,7 +77,7 @@ serve(async (req) => {
 
     console.log("✅ Pixel processed for:", tag);
 
-    // Return transparent 1x1 GIF pixel
+    // --- Transparent GIF ---
     const pixel = new Uint8Array([
       71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0,
       0, 0, 0, 255, 255, 255, 33, 249, 4, 1, 0, 0,

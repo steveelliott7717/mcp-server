@@ -49,7 +49,7 @@ Implemented as Supabase Edge Functions (Deno/TypeScript):
 - `gmail-semantic-search` — email search with recency weighting
 - `embed-chunk` — webhook-triggered embedding generation
 - `screenplay-semantic-search` — screenplay element search
-- `track-email-open` — pixel-based open tracking
+- `track_email_open` — pixel-based open tracking
 
 ## Database Schemas
 

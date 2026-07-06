@@ -4181,7 +4181,7 @@ Steve Elliott
 
     // --- Add tracking pixel if tracking is enabled ---
     if (shouldTrack) {
-        const pixelUrl = `https://${process.env.SUPABASE_PROJECT_REF}.supabase.co/functions/v1/track-email-open?tag=${tag}`;
+        const pixelUrl = `https://${process.env.SUPABASE_PROJECT_REF}.supabase.co/functions/v1/track_email_open?tag=${tag}`;
         const pixelHtml = `<img src="${pixelUrl}" width="1" height="1" style="display:none;" alt="">`;
 
         if (/<\/body>/i.test(finalBody)) {
