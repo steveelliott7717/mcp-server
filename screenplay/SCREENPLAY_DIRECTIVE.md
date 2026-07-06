@@ -86,23 +86,16 @@ Query characters by script to resolve `character_id` and `script_name`:
 
 ### ⚙️ RPCs
 
-All RPCs are called via `http_fetch` against the Supabase REST API with `Content-Profile: screenplay`.
+All RPCs are called via the `screenplay_rpc` tool. Auth is handled server-side — never send project keys (`apikey` / `Authorization` headers) from the client, and do NOT call `/rest/v1/rpc/*` through `http_fetch` (the server strips auth for its own Supabase host, so that path returns 401).
 
 #### `insert_element` — Insert a script element with fractional positioning
 
 ```json
 {
-  "name": "http_fetch",
+  "name": "screenplay_rpc",
   "arguments": {
-    "url": "https://umlhceqkwdkpfcdjpueq.supabase.co/rest/v1/rpc/insert_element",
-    "method": "POST",
-    "headers": {
-      "Content-Type": "application/json",
-      "apikey": "<SUPABASE_SERVICE_ROLE_KEY>",
-      "Authorization": "Bearer <SUPABASE_SERVICE_ROLE_KEY>",
-      "Content-Profile": "screenplay"
-    },
-    "body": {
+    "function": "insert_element",
+    "args": {
       "p_script_id": 1,
       "p_scene_id": 1,
       "p_type": "action",
@@ -111,8 +104,7 @@ All RPCs are called via `http_fetch` against the Supabase REST API with `Content
       "p_character_id": null,
       "p_parenthetical": null,
       "p_dialogue_modifier": null
-    },
-    "response_type": "json"
+    }
   }
 }
 ```
@@ -125,17 +117,10 @@ All RPCs are called via `http_fetch` against the Supabase REST API with `Content
 
 ```json
 {
-  "name": "http_fetch",
+  "name": "screenplay_rpc",
   "arguments": {
-    "url": "https://umlhceqkwdkpfcdjpueq.supabase.co/rest/v1/rpc/insert_scene",
-    "method": "POST",
-    "headers": {
-      "Content-Type": "application/json",
-      "apikey": "<SUPABASE_SERVICE_ROLE_KEY>",
-      "Authorization": "Bearer <SUPABASE_SERVICE_ROLE_KEY>",
-      "Content-Profile": "screenplay"
-    },
-    "body": {
+    "function": "insert_scene",
+    "args": {
       "p_script_id": 1,
       "p_int_ext": "INT.",
       "p_location": "COFFEE SHOP",
@@ -143,8 +128,7 @@ All RPCs are called via `http_fetch` against the Supabase REST API with `Content
       "p_time_of_day": "DAY",
       "p_modifier": null,
       "p_after_scene_id": null
-    },
-    "response_type": "json"
+    }
   }
 }
 ```
@@ -158,21 +142,13 @@ All RPCs are called via `http_fetch` against the Supabase REST API with `Content
 
 ```json
 {
-  "name": "http_fetch",
+  "name": "screenplay_rpc",
   "arguments": {
-    "url": "https://umlhceqkwdkpfcdjpueq.supabase.co/rest/v1/rpc/move_element",
-    "method": "POST",
-    "headers": {
-      "Content-Type": "application/json",
-      "apikey": "<SUPABASE_SERVICE_ROLE_KEY>",
-      "Authorization": "Bearer <SUPABASE_SERVICE_ROLE_KEY>",
-      "Content-Profile": "screenplay"
-    },
-    "body": {
+    "function": "move_element",
+    "args": {
       "p_element_id": 5,
       "p_after_id": 3
-    },
-    "response_type": "json"
+    }
   }
 }
 ```
@@ -313,21 +289,13 @@ When the user says something like "move the transition after Andrew's closing li
 
 ```json
 {
-  "name": "http_fetch",
+  "name": "screenplay_rpc",
   "arguments": {
-    "url": "https://umlhceqkwdkpfcdjpueq.supabase.co/rest/v1/rpc/move_element",
-    "method": "POST",
-    "headers": {
-      "Content-Type": "application/json",
-      "apikey": "<SUPABASE_SERVICE_ROLE_KEY>",
-      "Authorization": "Bearer <SUPABASE_SERVICE_ROLE_KEY>",
-      "Content-Profile": "screenplay"
-    },
-    "body": {
+    "function": "move_element",
+    "args": {
       "p_element_id": 7,
       "p_after_id": 12
-    },
-    "response_type": "json"
+    }
   }
 }
 ```

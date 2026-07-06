@@ -910,6 +910,7 @@ async function callOneToolByName(name, args, devAuthorized = false) {
     else if (name === "facebook_messages") return tool_facebook_messages(args);
     else if (name === 'http_fetch') return tool_http_fetch(args);
     else if (name === 'semantic_search') return tool_semantic_search(args);
+    else if (name === 'screenplay_rpc') return tool_screenplay_rpc(args);
     else if (name === 'notify_push') return tool_notify_push(args);
     else if (name === 'poshmark_edit_listing') return tool_poshmark_edit_listing(args);
     else if (name === 'poshmark_post_comment') return tool_poshmark_post_comment(args);
@@ -1764,6 +1765,7 @@ app.post('/sse', async (req, res) => {
             else if (name === "facebook_messages") content = await tool_facebook_messages(args);
             else if (name === 'http_fetch') content = await tool_http_fetch(args);
             else if (name === 'semantic_search') content = await tool_semantic_search(args);
+            else if (name === 'screenplay_rpc') content = await tool_screenplay_rpc(args);
             else if (name === 'notify_push') content = await tool_notify_push(args);
             else if (name === 'poshmark_edit_listing') content = await tool_poshmark_edit_listing(args);
             else if (name === 'poshmark_post_comment') content = await tool_poshmark_post_comment(args);
@@ -2576,6 +2578,15 @@ function toolsPayload(){
         timeout_ms:{ type:'number', default:30000 }
       },
       required:['query_text']
+    }},
+
+    { name:'screenplay_rpc', description:'Call one of the screenplay positioning RPCs (insert_element, insert_scene, move_element) with server-side auth. Use this instead of http_fetch against /rest/v1/rpc/*', inputSchema:{
+      type:'object',
+      properties:{
+        function:{ type:'string', enum:['insert_element','insert_scene','move_element'], description:'RPC to call' },
+        args:{ type:'object', description:'RPC arguments, e.g. { "p_element_id": 5, "p_after_id": 3 }' }
+      },
+      required:['function','args']
     }},
 
     // === Adapters (unchanged) ===
@@ -4867,6 +4878,23 @@ async function tool_semantic_search(args = {}) {
     const text = await res.text();
     let data; try { data = JSON.parse(text); } catch { data = text; }
     if (!res.ok) throw new Error(`${fn} failed: HTTP ${res.status} — ${(typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 500)}`);
+    return asJsonContent(data);
+}
+
+//////////////////////////////
+// Screenplay RPC tool
+//////////////////////////////
+// Server-side proxy for the screenplay positioning RPCs. These were
+// documented as raw http_fetch calls carrying the service_role key in the
+// client's context; the allowlist plus the server-held client means callers
+// never need a project key.
+const SCREENPLAY_RPCS = new Set(['insert_element', 'insert_scene', 'move_element']);
+
+async function tool_screenplay_rpc(args = {}) {
+    const { function: fnName, args: rpcArgs = {} } = args;
+    if (!SCREENPLAY_RPCS.has(fnName)) throw new Error(`unknown function '${fnName}' — expected one of: ${[...SCREENPLAY_RPCS].join(', ')}`);
+    const { data, error } = await supabase.schema('screenplay').rpc(fnName, rpcArgs);
+    if (error) throw new Error(`${fnName} failed: ${error.message}`);
     return asJsonContent(data);
 }
 
