@@ -340,20 +340,16 @@ When the user says something like "move the transition after Andrew's closing li
 
 ### 🔎 Screenplay Semantic Search
 
-When the user asks to search screenplay content semantically:
+When the user asks to search screenplay content semantically, use the `semantic_search` tool — do NOT call the Edge Function through `http_fetch` (the server strips auth for its own Supabase host, so that path returns 401):
 
 ```json
 {
-  "name": "http_fetch",
+  "name": "semantic_search",
   "arguments": {
-    "url": "https://umlhceqkwdkpfcdjpueq.supabase.co/functions/v1/screenplay-semantic-search",
-    "method": "POST",
-    "body": {
-      "query_text": "<user query>",
-      "script_id": 1,
-      "match_count": 10
-    },
-    "response_type": "json",
+    "target": "screenplay",
+    "query_text": "<user query>",
+    "script_id": 1,
+    "match_count": 10,
     "timeout_ms": 20000
   }
 }

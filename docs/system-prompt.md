@@ -303,14 +303,15 @@ Use the Gmail API directly — do not re-create:
 
 ### Gmail Semantic Search
 
+Use the `semantic_search` tool — do NOT call the Edge Function through `http_fetch` (the server strips auth for its own Supabase host, so that path returns 401):
+
 ```json
 {
-  "name": "http_fetch",
+  "name": "semantic_search",
   "arguments": {
-    "url": "<SUPABASE_PROJECT_URL>/functions/v1/gmail-semantic-search",
-    "method": "POST",
-    "body": "{\"query_text\": \"<user query>\", \"table_name\": \"all_emails\", \"schema\": \"gmail\", \"match_count\": 10}",
-    "response_type": "json",
+    "target": "gmail",
+    "query_text": "<user query>",
+    "match_count": 10,
     "timeout_ms": 20000
   }
 }

@@ -909,6 +909,7 @@ async function callOneToolByName(name, args, devAuthorized = false) {
     else if (name === "send_email") return tool_send_email(args);
     else if (name === "facebook_messages") return tool_facebook_messages(args);
     else if (name === 'http_fetch') return tool_http_fetch(args);
+    else if (name === 'semantic_search') return tool_semantic_search(args);
     else if (name === 'notify_push') return tool_notify_push(args);
     else if (name === 'poshmark_edit_listing') return tool_poshmark_edit_listing(args);
     else if (name === 'poshmark_post_comment') return tool_poshmark_post_comment(args);
@@ -1762,6 +1763,7 @@ app.post('/sse', async (req, res) => {
             else if (name === "send_email") content = await tool_send_email(args);
             else if (name === "facebook_messages") content = await tool_facebook_messages(args);
             else if (name === 'http_fetch') content = await tool_http_fetch(args);
+            else if (name === 'semantic_search') content = await tool_semantic_search(args);
             else if (name === 'notify_push') content = await tool_notify_push(args);
             else if (name === 'poshmark_edit_listing') content = await tool_poshmark_edit_listing(args);
             else if (name === 'poshmark_post_comment') content = await tool_poshmark_post_comment(args);
@@ -2560,6 +2562,21 @@ function toolsPayload(){
       },
 
 
+
+    { name:'semantic_search', description:'Hybrid semantic (RAG) search via the Supabase search Edge Functions; auth is handled server-side. Use this instead of http_fetch for semantic-search, gmail-semantic-search and screenplay-semantic-search', inputSchema:{
+      type:'object',
+      additionalProperties: true,
+      properties:{
+        target:{ type:'string', enum:['generic','gmail','screenplay'], default:'generic', description:'generic=semantic-search (any table; requires table_name), gmail=gmail-semantic-search (defaults to gmail.all_emails), screenplay=screenplay-semantic-search' },
+        query_text:{ type:'string', description:'Natural-language search query' },
+        table_name:{ type:'string', description:'Table containing embeddings (required for generic target)' },
+        schema:{ type:'string', description:'Postgres schema of the table (generic default: public)' },
+        match_count:{ type:'number', default:5 },
+        script_id:{ type:'number', description:'(screenplay) script id' },
+        timeout_ms:{ type:'number', default:30000 }
+      },
+      required:['query_text']
+    }},
 
     // === Adapters (unchanged) ===
     { name:'http_fetch', description:'Fetch an HTTP(S) resource with safety, retries, destinations', inputSchema:{
@@ -4821,6 +4838,37 @@ function tryParseJSON(buf){ try{ return JSON.parse(buf.toString('utf-8')); }catc
 // Host allow/deny helper
 //////////////////////////////
 function hostAllowed(host, allowHosts, denyHosts){ if (allowHosts.length && !allowHosts.includes(host)) return false; if (denyHosts.length && denyHosts.includes(host)) return false; return true; }
+
+//////////////////////////////
+// Semantic search tool
+//////////////////////////////
+// Server-side proxy to the search Edge Functions. The own-host guard in
+// tool_http_fetch strips bearer tokens for our Supabase project, so those
+// functions can't be reached through http_fetch. This tool holds the auth
+// server-side and exposes only the three search functions — callers never
+// see the key.
+const SEMANTIC_SEARCH_FUNCTIONS = {
+    generic: 'semantic-search',
+    gmail: 'gmail-semantic-search',
+    screenplay: 'screenplay-semantic-search',
+};
+
+async function tool_semantic_search(args = {}) {
+    const { target = 'generic', timeout_ms, ...body } = args;
+    const fn = SEMANTIC_SEARCH_FUNCTIONS[target];
+    if (!fn) throw new Error(`unknown target '${target}' — expected one of: ${Object.keys(SEMANTIC_SEARCH_FUNCTIONS).join(', ')}`);
+    if (!body.query_text && !body.query) throw new Error('query_text is required');
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/${fn}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(Math.min(Number(timeout_ms) || 30000, 120000)),
+    });
+    const text = await res.text();
+    let data; try { data = JSON.parse(text); } catch { data = text; }
+    if (!res.ok) throw new Error(`${fn} failed: HTTP ${res.status} — ${(typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 500)}`);
+    return asJsonContent(data);
+}
 
 //////////////////////////////
 // HTTP Fetch tool
