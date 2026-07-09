@@ -32,7 +32,7 @@ build-backend = "hatchling.build"
 packages = ["app"]
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
@@ -42,6 +42,14 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.11"
 warn_unused_ignores = true
 ignore_missing_imports = true
+
+# LangChain constructors use pydantic field aliases and SecretStr coercion, and
+# with_structured_output has a loose (dict | BaseModel) return type, which mypy
+# can't follow. Scope those specific codes off for the modules that touch it;
+# the pure-logic modules (graph, retriever, config, models, main) stay strict.
+[[tool.mypy.overrides]]
+module = ["app.llm", "app.embeddings", "app.nodes"]
+disable_error_code = ["call-arg", "arg-type", "assignment"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

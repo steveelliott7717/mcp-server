@@ -114,7 +114,7 @@ class HybridRetriever:
         lexical = _min_max(bm25_scores(query, contents))
         combined = [
             settings.cosine_weight * c + settings.bm25_weight * lx
-            for c, lx in zip(cosine, lexical)
+            for c, lx in zip(cosine, lexical, strict=False)
         ]
 
         docs = [
@@ -125,7 +125,7 @@ class HybridRetriever:
                 source_filename=r.get("source_filename"),
                 section_title=r.get("section_title"),
             )
-            for r, score in zip(rows, combined)
+            for r, score in zip(rows, combined, strict=False)
         ]
         docs.sort(key=lambda d: d.score, reverse=True)
         return docs[:k]
