@@ -910,6 +910,7 @@ async function callOneToolByName(name, args, devAuthorized = false) {
     else if (name === "facebook_messages") return tool_facebook_messages(args);
     else if (name === 'http_fetch') return tool_http_fetch(args);
     else if (name === 'semantic_search') return tool_semantic_search(args);
+    else if (name === 'agentic_rag_query') return tool_agentic_rag_query(args);
     else if (name === 'screenplay_rpc') return tool_screenplay_rpc(args);
     else if (name === 'notify_push') return tool_notify_push(args);
     else if (name === 'poshmark_edit_listing') return tool_poshmark_edit_listing(args);
@@ -1765,6 +1766,7 @@ app.post('/sse', async (req, res) => {
             else if (name === "facebook_messages") content = await tool_facebook_messages(args);
             else if (name === 'http_fetch') content = await tool_http_fetch(args);
             else if (name === 'semantic_search') content = await tool_semantic_search(args);
+            else if (name === 'agentic_rag_query') content = await tool_agentic_rag_query(args);
             else if (name === 'screenplay_rpc') content = await tool_screenplay_rpc(args);
             else if (name === 'notify_push') content = await tool_notify_push(args);
             else if (name === 'poshmark_edit_listing') content = await tool_poshmark_edit_listing(args);
@@ -2578,6 +2580,16 @@ function toolsPayload(){
         timeout_ms:{ type:'number', default:30000 }
       },
       required:['query_text']
+    }},
+
+    { name:'agentic_rag_query', description:'Answer a natural-language question over the professional_profile work-experience corpus using a self-correcting (corrective-RAG) LangGraph pipeline: hybrid retrieve, grade documents, generate, then verify groundedness, with bounded retries. Runs as a short-lived Python subprocess (rag-service) so it uses no memory when idle. Returns a grounded answer plus the supporting documents.', inputSchema:{
+      type:'object',
+      additionalProperties: false,
+      properties:{
+        question:{ type:'string', description:'Natural-language question to answer from the work-experience corpus' },
+        match_count:{ type:'number', default:5, description:'Max supporting documents used to ground the answer' }
+      },
+      required:['question']
     }},
 
     { name:'screenplay_rpc', description:'Call one of the screenplay positioning RPCs (insert_element, insert_scene, move_element) with server-side auth. Use this instead of http_fetch against /rest/v1/rpc/*', inputSchema:{
@@ -4879,6 +4891,41 @@ async function tool_semantic_search(args = {}) {
     let data; try { data = JSON.parse(text); } catch { data = text; }
     if (!res.ok) throw new Error(`${fn} failed: HTTP ${res.status} — ${(typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 500)}`);
     return asJsonContent(data);
+}
+
+//////////////////////////////
+// Agentic RAG tool (rag-service subprocess)
+//////////////////////////////
+// Spawns the Python rag-service (FastAPI/LangGraph core) as a short-lived
+// subprocess: writes the question as JSON to stdin, reads the JSON answer from
+// stdout, then the process exits — so RAM is consumed only while a query runs.
+// The agent can pass only a question (+ match_count), never SQL/schema/table,
+// so its reachable capability stays "retrieve and answer" over the allowlisted
+// corpus. Overridable via RAG_SERVICE_DIR / RAG_SERVICE_PYTHON.
+async function tool_agentic_rag_query(args = {}) {
+    const { question, match_count } = args || {};
+    if (!question || typeof question !== 'string') throw new Error('question (string) is required');
+    const ragDir = process.env.RAG_SERVICE_DIR || new URL('./rag-service', import.meta.url).pathname;
+    const py = process.env.RAG_SERVICE_PYTHON || path.join(ragDir, '.venv', 'bin', 'python');
+    const { spawn } = await import('child_process');
+    const payload = JSON.stringify({ question, match_count });
+    return await new Promise((resolve, reject) => {
+        const child = spawn(py, ['-m', 'app'], { cwd: ragDir });
+        let out = '', err = '';
+        const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} reject(new Error('agentic_rag_query timed out')); }, 90000);
+        child.stdout.on('data', d => { out += d; });
+        child.stderr.on('data', d => { err += d; });
+        child.on('error', e => { clearTimeout(timer); reject(new Error(`rag-service spawn failed: ${e.message}`)); });
+        child.on('close', code => {
+            clearTimeout(timer);
+            if (code !== 0) return reject(new Error(`rag-service exited ${code}: ${(err || out).slice(0, 500)}`));
+            let data; try { data = JSON.parse(out); } catch { return reject(new Error(`rag-service returned invalid JSON: ${out.slice(0, 300)}`)); }
+            if (data && data.error) return reject(new Error(`rag-service error: ${data.error}`));
+            resolve(asJsonContent(data));
+        });
+        child.stdin.write(payload);
+        child.stdin.end();
+    });
 }
 
 //////////////////////////////
