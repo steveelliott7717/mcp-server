@@ -33,6 +33,8 @@ MCP Server (Express, port 3000)
 
 **Push Notifications** — `push_notify` via Pushover with priority categories
 
+**Agentic RAG** — `agentic_rag_query`: self-correcting RAG answer over the professional-profile corpus, served by a Python/FastAPI/LangGraph companion service (see below)
+
 ## RAG Pipeline
 
 Hybrid semantic search across multiple domains:
@@ -50,6 +52,16 @@ Implemented as Supabase Edge Functions (Deno/TypeScript):
 - `embed-chunk` — webhook-triggered embedding generation
 - `screenplay-semantic-search` — screenplay element search
 - `track_email_open` — pixel-based open tracking
+
+## Agentic RAG Service (Python · FastAPI · LangGraph)
+
+A companion microservice ([`rag-service/`](rag-service/)) that adds a **self-correcting** retrieval loop on top of the RAG pipeline above. Where the Edge Functions return ranked passages, this service returns a *verified answer*: it retrieves, grades the retrieved documents for relevance, generates, then checks the answer for groundedness and whether it addresses the question — rewriting the query or regenerating on failure, with bounded retries.
+
+- **Framework**: LangGraph state machine (retrieve → grade documents → generate → grade generation, with conditional edges and retry ceilings)
+- **API**: FastAPI with streaming (SSE) plus a per-call CLI entry point; called by the MCP server as the `agentic_rag_query` tool
+- **Retrieval**: pgvector cosine top-k via a PostgREST RPC (in-DB), BM25 lexical re-rank in app (55/45) — no direct DB connection, so the service holds no DDL or write capability
+- **Models**: Claude (generation + grading), OpenAI `text-embedding-3-large` (query embedding)
+- **Quality**: pytest + ruff + mypy in CI, plus a groundedness/recall eval harness over the real corpus
 
 ## Database Schemas
 
@@ -108,3 +120,7 @@ Each module has its own cron scripts running via system crontab with `flock` loc
 - **Evaluation**: OpenAI `gpt-4o-mini`
 - **Process Management**: systemd
 - **Logging**: pino
+
+### Companion service — [`rag-service/`](rag-service/)
+
+Python · FastAPI · LangGraph · LangChain · Pydantic · pgvector (via PostgREST RPC) · Docker · pytest / ruff / mypy
