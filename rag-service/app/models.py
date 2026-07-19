@@ -1,5 +1,7 @@
 """Pydantic models: API request/response and LLM structured-output grading schemas."""
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -24,6 +26,26 @@ class RetrievedDoc(BaseModel):
     section_title: str | None = None
 
 
+class GradeEvent(BaseModel):
+    """One grading decision, captured for observability.
+
+    The grader already produces a `reasoning` string on every call (see the
+    schemas below); this record stops it being discarded, so a run's full
+    grading sequence — which verdict fired on which pass, and why — is legible
+    afterward instead of being reconstructed from pass counts.
+    """
+
+    stage: Literal["documents", "generation"]
+    pass_no: int  # retrieval pass (documents) or generation pass this grade belongs to
+    reasoning: str
+    # documents-stage fields
+    doc_id: str | None = None
+    relevant: bool | None = None
+    # generation-stage fields
+    grounded: bool | None = None
+    addresses_question: bool | None = None
+
+
 class QueryResponse(BaseModel):
     answer: str
     documents: list[RetrievedDoc]
@@ -31,6 +53,7 @@ class QueryResponse(BaseModel):
     generation_passes: int
     grounded: bool
     addresses_question: bool
+    grade_log: list[GradeEvent] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #

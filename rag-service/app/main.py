@@ -80,6 +80,7 @@ async def query_sync(req: QueryRequest) -> QueryResponse:
         generation_passes=final.get("generation_passes", 0),
         grounded=final.get("grounded", False),
         addresses_question=final.get("addresses_question", False),
+        grade_log=final.get("grade_log", []),
     )
 
 
@@ -98,6 +99,10 @@ async def query_stream(req: QueryRequest) -> StreamingResponse:
                 if "grounded" in node_state:
                     payload["grounded"] = node_state["grounded"]
                     payload["addresses_question"] = node_state.get("addresses_question")
+                if "grade_log" in node_state:
+                    # This node's grading verdicts + reasoning (the reducer delta,
+                    # i.e. just this pass's events, not the accumulated log).
+                    payload["grades"] = [e.model_dump() for e in node_state["grade_log"]]
                 yield f"data: {json.dumps(payload)}\n\n"
         yield "data: [DONE]\n\n"
 

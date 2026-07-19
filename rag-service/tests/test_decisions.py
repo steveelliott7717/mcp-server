@@ -1,6 +1,9 @@
 """Unit tests for the graph's routing logic (no external services required)."""
 
+import operator
+
 from app.graph import decide_after_generation, decide_after_grading
+from app.models import GradeEvent
 
 
 def test_grading_routes_to_generate_when_docs_present():
@@ -31,3 +34,13 @@ def test_generation_ends_when_grounded_and_on_topic():
 
 def test_generation_stops_after_ceiling_even_if_ungrounded():
     assert decide_after_generation({"grounded": False, "generation_passes": 3}) == "useful"
+
+
+def test_grade_log_reducer_accumulates_across_passes():
+    # The grade_log field uses operator.add so retries append rather than
+    # overwrite — mirrors how the graph threads events across passes.
+    pass1 = [GradeEvent(stage="documents", pass_no=1, reasoning="r1", relevant=True)]
+    pass2 = [GradeEvent(stage="generation", pass_no=1, reasoning="r2", grounded=False)]
+    combined = operator.add(pass1, pass2)
+    assert [e.stage for e in combined] == ["documents", "generation"]
+    assert len(combined) == 2

@@ -40,6 +40,7 @@ async def _run(payload: dict) -> dict:
             "generation_passes": final.get("generation_passes", 0),
             "grounded": final.get("grounded", False),
             "addresses_question": final.get("addresses_question", False),
+            "grade_log": [e.model_dump() for e in final.get("grade_log", [])],
         }
 
 

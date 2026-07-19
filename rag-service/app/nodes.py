@@ -1,13 +1,14 @@
 """LangGraph node implementations for the agentic (corrective) RAG loop."""
 
 import asyncio
-from typing import TypedDict
+import operator
+from typing import Annotated, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .config import get_settings
 from .llm import get_generation_llm, get_grading_llm
-from .models import GenerationGrade, GradeDocument, RetrievedDoc
+from .models import GenerationGrade, GradeDocument, GradeEvent, RetrievedDoc
 from .retriever import HybridRetriever
 
 
@@ -23,6 +24,10 @@ class GraphState(TypedDict, total=False):
     addresses_question: bool
     retrieval_passes: int
     generation_passes: int
+    # Append-only trace of every grading decision across all passes. The
+    # operator.add reducer concatenates each node's events instead of
+    # overwriting, so retries accumulate rather than clobber one another.
+    grade_log: Annotated[list[GradeEvent], operator.add]
 
 
 def format_docs(docs: list[RetrievedDoc]) -> str:
@@ -48,8 +53,9 @@ class Nodes:
     async def grade_documents(self, state: GraphState) -> GraphState:
         grader = self._grader.with_structured_output(GradeDocument)
         question = state["question"]
+        pass_no = state.get("retrieval_passes", 0)
 
-        async def grade(doc: RetrievedDoc) -> RetrievedDoc | None:
+        async def grade(doc: RetrievedDoc) -> tuple[RetrievedDoc | None, GradeEvent]:
             result: GradeDocument = await grader.ainvoke(
                 [
                     SystemMessage(
@@ -67,10 +73,20 @@ class Nodes:
                     HumanMessage(content=f"Question: {question}\n\nDocument:\n{doc.content}"),
                 ]
             )
-            return doc if result.relevant else None
+            event = GradeEvent(
+                stage="documents",
+                pass_no=pass_no,
+                reasoning=result.reasoning,
+                doc_id=doc.id,
+                relevant=result.relevant,
+            )
+            return (doc if result.relevant else None), event
 
         graded = await asyncio.gather(*(grade(d) for d in state.get("documents", [])))
-        return {"documents": [d for d in graded if d is not None]}
+        return {
+            "documents": [doc for doc, _ in graded if doc is not None],
+            "grade_log": [event for _, event in graded],
+        }
 
     async def transform_query(self, state: GraphState) -> GraphState:
         rewritten = await self._gen.ainvoke(
@@ -131,4 +147,15 @@ class Nodes:
                 ),
             ]
         )
-        return {"grounded": result.grounded, "addresses_question": result.addresses_question}
+        event = GradeEvent(
+            stage="generation",
+            pass_no=state.get("generation_passes", 0),
+            reasoning=result.reasoning,
+            grounded=result.grounded,
+            addresses_question=result.addresses_question,
+        )
+        return {
+            "grounded": result.grounded,
+            "addresses_question": result.addresses_question,
+            "grade_log": [event],
+        }
