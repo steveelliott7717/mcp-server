@@ -11,6 +11,10 @@ import { callTool } from "./mcp.js";
 
 const LOCAL_TIMEZONE = "Europe/Berlin";
 
+// notify_on_the_day_time is a `time without time zone` — the column carries no zone of its
+// own, so it is interpreted as LOCAL_TIMEZONE wall-clock ("09:00:00" means 9am Berlin).
+const ON_THE_DAY_CATCH_UP_MS = 60 * 60 * 1000; // still fire after a missed run, but not all day
+
 /* -------------------------------------------------------------------------- */
 /* 🧠 Utility Functions                                                       */
 /* -------------------------------------------------------------------------- */
@@ -121,6 +125,27 @@ function nowISO() {
     return new Date().toISOString();
 }
 
+/** UTC offset of `timeZone` at a given instant, in ms. */
+function zoneOffsetMs(instant, timeZone) {
+    const name = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "longOffset" })
+        .formatToParts(instant)
+        .find((p) => p.type === "timeZoneName").value; // "GMT+02:00", or plain "GMT" for UTC
+    const m = /GMT([+-])(\d{2}):(\d{2})/.exec(name);
+    if (!m) return 0;
+    return (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) * 60000;
+}
+
+/**
+ * Resolve a local wall-clock date + time to the absolute instant it refers to.
+ *   ("2026-08-20", "09:00:00", "Europe/Berlin") -> 2026-08-20T07:00:00Z
+ * Two passes, so a date landing on a DST transition resolves against the correct offset.
+ */
+function localWallClockToInstant(dateStr, timeStr, timeZone) {
+    const naive = new Date(`${dateStr}T${timeStr}Z`);
+    const first = new Date(naive.getTime() - zoneOffsetMs(naive, timeZone));
+    return new Date(naive.getTime() - zoneOffsetMs(first, timeZone));
+}
+
 /** Query both events and recurring_event_instances tables */
 async function queryBothEventTables(selectFields, whereConditions, runId) {
     let allRows = [];
@@ -176,7 +201,7 @@ async function sendOnTheDayNotification(event, runId) {
     const eventTime = formatEventTime(event.start_time);
     const title = `📅 Today: ${event.title}`;
     const body = event.location
-        ? `${eventTime} • ${event.location}}`
+        ? `${eventTime} • ${event.location}`
         : eventTime;
 
     try {
@@ -293,11 +318,7 @@ async function sendAtStartNotification(event, runId) {
 async function processOnTheDayNotifications(runId) {
     console.log(`[${runId}] 🔍 Checking for "on the day" notifications...`);
 
-    // Use Berlin for date check (matches formatEventTime) and UTC for time check
-    // (notify_on_the_day_time is stored as UTC)
     const nowUTC = new Date();
-    const todayBerlin = nowUTC.toLocaleDateString("en-CA", { timeZone: LOCAL_TIMEZONE }); // "YYYY-MM-DD"
-    const currentTimeUTC = nowUTC.toISOString().slice(11, 19); // "HH:MM:SS"
 
     // Query both tables
     const rows = await queryBothEventTables(
@@ -313,21 +334,21 @@ async function processOnTheDayNotifications(runId) {
 
     let sent = 0;
     for (const event of rows) {
-        // Check event date in Berlin — consistent with how formatEventTime displays it
-        const eventDateBerlin = new Date(event.start_time).toLocaleDateString("en-CA", { timeZone: LOCAL_TIMEZONE });
+        // Resolve "notify_on_the_day_time on the event's local date" to one absolute instant.
+        // Both halves must come from the same clock: comparing a LOCAL date against a UTC
+        // time-of-day fires the moment the local date rolls over (midnight here), not at the
+        // configured time, because any UTC clock reading is already >= a morning target.
+        const eventDateLocal = new Date(event.start_time)
+            .toLocaleDateString("en-CA", { timeZone: LOCAL_TIMEZONE }); // "YYYY-MM-DD"
+        const notifyTime = (event.notify_on_the_day_time || "09:00:00").slice(0, 8); // "HH:MM:SS"
+        const dueAt = localWallClockToInstant(eventDateLocal, notifyTime, LOCAL_TIMEZONE);
 
-        // Only process if event is actually today in Berlin time
-        if (eventDateBerlin !== todayBerlin) {
-            continue;
-        }
+        if (nowUTC < dueAt) continue;                                    // not due yet
+        if (nowUTC - dueAt > ON_THE_DAY_CATCH_UP_MS) continue;           // too stale to be useful
 
-        // Check if current UTC time >= notification UTC time
-        const notifyTime = event.notify_on_the_day_time || "09:00:00";
-        if (currentTimeUTC >= notifyTime) {
-            const success = await sendOnTheDayNotification(event, runId);
-            if (success) sent++;
-            await new Promise((r) => setTimeout(r, 250)); // Rate limiting
-        }
+        const success = await sendOnTheDayNotification(event, runId);
+        if (success) sent++;
+        await new Promise((r) => setTimeout(r, 250)); // Rate limiting
     }
 
     console.log(`[${runId}] ✅ Sent ${sent}/${rows.length} "on the day" notifications`);
