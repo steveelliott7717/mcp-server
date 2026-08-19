@@ -1522,7 +1522,7 @@ app.use('/sse', (req, res, next) => {
 
 
 const manHits = new Map();
-const MAN_WINDOW_MS = 10_000, MAN_LIMIT = 5;
+const MAN_WINDOW_MS = 10_000, MAN_LIMIT = 60;
 function manualLimiter(req, res, next) {
   const now = Date.now();
   const ip = (req.ip ?? req.socket?.remoteAddress ?? 'unknown');
@@ -4171,10 +4171,42 @@ Steve Elliott
     // Mark as reply-to-sent only if explicitly passed
     const shouldMarkReplySent = args.reply_to_sent === true;
 
+    // --- Pre-escaped input guard ---
+    // Real incident (2026-07-21, tag REQ-RSXFFG): a client composed the tool call
+    // with HTML-entity-escaped args (&lt;p&gt; body, &lt;&gt; subject). With no real
+    // tags present, the plain-text wrap branch shipped the entities visibly to the
+    // recipient. If the body looks like escaped HTML (escaped tags, no real ones),
+    // decode entities once before HTML detection; same for entity-bearing subjects.
+    function decodeHtmlEntities(text = "") {
+        return text
+            .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+            .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+            .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+            .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+            .replace(/&nbsp;/g, " ")
+            .replace(/&mdash;/g, "—").replace(/&ndash;/g, "–")
+            .replace(/&rsquo;/g, "'").replace(/&lsquo;/g, "'")
+            .replace(/&rdquo;/g, '"').replace(/&ldquo;/g, '"')
+            .replace(/&amp;/g, "&"); // last, so &amp;lt; can't double-decode
+    }
+
+    let bodyArg = body;
+    if (typeof bodyArg === 'string'
+        && /&lt;\/?[a-z]/i.test(bodyArg)
+        && !/<\/?[a-z][\s\S]*>/i.test(bodyArg)) {
+        console.warn('[send_email] ⚠️ body arrived HTML-entity-escaped with no real tags — decoding before HTML detection');
+        bodyArg = decodeHtmlEntities(bodyArg);
+    }
+    let subjectArg = subject;
+    if (typeof subjectArg === 'string' && /&(lt|gt|amp|quot|apos|nbsp|mdash|ndash|#\d+|#x[0-9a-f]+);/i.test(subjectArg)) {
+        console.warn('[send_email] ⚠️ subject contains HTML entities — decoding');
+        subjectArg = decodeHtmlEntities(subjectArg);
+    }
+
     // 5️⃣ Add subject/body sanitization before MIME
-    const originalSubject = subject || "(no subject)"; // ← ADD THIS LINE
-    const safeSubject = sanitizeSubject(subject || "(no subject)");
-    const safeBody = sanitizeBody(body || "(empty message)");
+    const originalSubject = subjectArg || "(no subject)"; // ← ADD THIS LINE
+    const safeSubject = sanitizeSubject(subjectArg || "(no subject)");
+    const safeBody = sanitizeBody(bodyArg || "(empty message)");
     let finalBody = safeBody;
     // Ensure the sanitized body remains valid UTF-8 text
     finalBody = Buffer.from(finalBody, "utf8").toString("utf8");
