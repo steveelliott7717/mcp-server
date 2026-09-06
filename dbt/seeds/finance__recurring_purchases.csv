@@ -1,0 +1,7 @@
+id,category,vendor,item_name,quantity,base_cost,shipping_cost,tax_cost,other_cost,frequency,start_charge_date,next_charge_date,active,card_type,card_last4
+1,software,GitHub,Copilot Pro,1,10.0,0.0,1.9,0.0,monthly,2025-10-02,2026-09-23,true,Mastercard,4291
+2,software,Anthropic,Claude Pro,1,20.0,0.0,3.8,0.0,monthly,2025-12-01,2026-09-02,true,Visa,7733
+3,media,Spotify,Premium Duo,1,14.99,0.0,2.85,0.0,monthly,2026-04-07,2026-09-01,true,Visa,4291
+4,utilities,Vodafone,Mobile Plan,1,29.99,0.0,5.7,0.0,monthly,2026-01-21,2026-09-19,true,Mastercard,7733
+5,fitness,McFit,Gym Membership,1,24.9,0.0,4.73,0.0,monthly,2026-01-04,2026-09-07,false,Visa,7733
+6,software,JetBrains,All Products Pack,1,289.0,0.0,54.91,0.0,yearly,2025-09-18,2026-09-10,true,Visa,4291

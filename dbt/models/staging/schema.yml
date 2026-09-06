@@ -1,0 +1,156 @@
+version: 2
+
+models:
+  - name: stg_weight_logs
+    description: Daily weigh-ins from health.weight_logs.
+    columns:
+      - name: weight_log_id
+        description: Primary key (health.weight_logs.id).
+        data_tests: [unique, not_null]
+      - name: log_date
+        data_tests: [not_null]
+      - name: weight_lbs
+        description: >
+          NOT NULL in the source DDL. Plausibility is asserted separately in
+          tests/assert_weight_plausible.sql, because the production table has
+          no CHECK constraint on it — a mis-entered weigh-in propagates into
+          BMR, step calories and strength calories before anything notices.
+        data_tests: [not_null]
+
+  - name: stg_step_logs
+    description: Daily step counts. actual_steps_taken lands on a two-day lag.
+    columns:
+      - name: step_log_id
+        data_tests: [unique, not_null]
+      - name: activity_date
+        data_tests: [not_null]
+      - name: calories_burned
+        data_tests: [not_null]
+
+  - name: stg_workout_logs
+    description: Strength training sets from health.workout_logs.
+    columns:
+      - name: workout_log_id
+        data_tests: [unique, not_null]
+      - name: scheduled_date
+        data_tests: [not_null]
+
+  - name: stg_bike_logs
+    description: "RECONSTRUCTED: health.bike_logs has no DDL in the repo."
+    columns:
+      - name: bike_log_id
+        data_tests: [unique, not_null]
+
+  - name: stg_weekly_programs
+    description: "RECONSTRUCTED: health.weekly_programs has no DDL in the repo."
+    columns:
+      - name: weekly_program_id
+        data_tests: [unique, not_null]
+      - name: start_date
+        data_tests: [not_null, unique]
+
+  - name: stg_meal_logs
+    description: Individual meal entries; macros arrive pre-scaled by quantity.
+    columns:
+      - name: meal_log_id
+        data_tests: [unique, not_null]
+      - name: calories
+        description: NOT NULL in the source DDL (health.meal_logs.calories).
+        data_tests: [not_null]
+      - name: meal_source_type
+        description: >
+          health.meal_logs allows recipe_id, food_item_id or batch_prep_id.
+          'unknown' would mean a row referencing none of them.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["recipe", "food_item"]
+
+  - name: stg_user_profile
+    columns:
+      - name: user_profile_id
+        data_tests: [unique, not_null]
+      - name: sex
+        description: Drives the Mifflin-St Jeor sex constant.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["male", "female"]
+
+  - name: stg_food_items
+    columns:
+      - name: food_item_id
+        data_tests: [unique, not_null]
+      - name: food_name
+        description: NOT NULL in the source DDL.
+        data_tests: [not_null]
+
+  - name: stg_recipes
+    columns:
+      - name: recipe_id
+        data_tests: [unique, not_null]
+
+  - name: stg_recipe_ingredients
+    columns:
+      - name: recipe_ingredient_id
+        data_tests: [unique, not_null]
+      - name: recipe_id
+        description: FK to health.recipes in the source DDL.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_recipes')
+                field: recipe_id
+      - name: food_item_id
+        description: FK to health.food_items in the source DDL.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_food_items')
+                field: food_item_id
+
+  - name: stg_purchases
+    columns:
+      - name: purchase_id
+        data_tests: [unique, not_null]
+      - name: item_name
+        description: NOT NULL in the source DDL.
+        data_tests: [not_null]
+      - name: card_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["Visa", "Mastercard"]
+
+  - name: stg_recurring_purchases
+    columns:
+      - name: recurring_purchase_id
+        data_tests: [unique, not_null]
+      - name: frequency
+        description: >
+          Mirrors the CHECK constraint on finance.recurring_purchases.frequency
+          verbatim.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["daily", "weekly", "biweekly", "monthly", "quarterly", "yearly"]
+
+  - name: stg_recurring_purchase_charges
+    columns:
+      - name: charge_id
+        data_tests: [unique, not_null]
+      - name: recurring_purchase_id
+        description: >
+          FK to finance.recurring_purchases, ON DELETE CASCADE in the source.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_recurring_purchases')
+                field: recurring_purchase_id
+      - name: charge_date
+        description: NOT NULL in the source DDL.
+        data_tests: [not_null]

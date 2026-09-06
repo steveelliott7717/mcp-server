@@ -1,0 +1,40 @@
+version: 2
+
+models:
+  - name: fct_daily_overview
+    description: >
+      One row per day, matching the column shape of
+      health.daily_overview_snapshot. Directly comparable to what the
+      production cron writes.
+    columns:
+      - name: snapshot_date
+        description: >
+          UNIQUE in the source DDL
+          (daily_overview_snapshot_snapshot_date_key). Asserted here for the
+          same reason the constraint exists there.
+        data_tests: [unique, not_null]
+      - name: total_kcal_target
+        data_tests: [not_null]
+      - name: calories_logged
+        description: Recomputed by aggregation, not accumulated by trigger.
+        data_tests: [not_null]
+
+  - name: fct_meal_consumption_daily
+    columns:
+      - name: logged_date
+        data_tests: [unique, not_null]
+      - name: meals_logged
+        data_tests: [not_null]
+
+  - name: fct_spend_monthly
+    description: One-off purchases unioned with materialised recurring charges.
+    columns:
+      - name: spend_month
+        data_tests: [not_null]
+      - name: spend_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["one_off", "recurring"]
+      - name: total_spend
+        data_tests: [not_null]

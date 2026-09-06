@@ -1,0 +1,9 @@
+# Local DuckDB profile. No credentials, no network, no connection to any
+# production database — the whole project builds from the CSVs in seeds/.
+mcp_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: mcp_analytics.duckdb
+      threads: 4

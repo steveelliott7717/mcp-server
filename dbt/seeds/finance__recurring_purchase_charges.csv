@@ -1,0 +1,17 @@
+id,recurring_purchase_id,vendor,item_name,charge_date,invoice_date,base_cost,tax_cost,other_cost,manually_overridden
+1,1,GitHub,Copilot Pro,2026-07-01,2026-07-01,10.0,1.9,0.0,false
+2,1,GitHub,Copilot Pro,2026-07-31,2026-07-31,10.0,1.9,0.0,false
+3,1,GitHub,Copilot Pro,2026-08-30,2026-08-30,10.0,1.9,0.0,false
+4,2,Anthropic,Claude Pro,2026-07-01,2026-07-01,20.0,3.8,0.0,false
+5,2,Anthropic,Claude Pro,2026-07-31,2026-07-31,20.0,3.8,0.0,false
+6,2,Anthropic,Claude Pro,2026-08-30,2026-08-30,20.0,3.8,0.0,false
+7,3,Spotify,Premium Duo,2026-07-01,2026-07-01,14.99,2.85,0.0,false
+8,3,Spotify,Premium Duo,2026-07-31,2026-07-31,14.99,2.85,0.0,false
+9,3,Spotify,Premium Duo,2026-08-30,2026-08-30,14.99,2.85,0.0,false
+10,4,Vodafone,Mobile Plan,2026-07-01,2026-07-01,29.99,5.7,0.0,false
+11,4,Vodafone,Mobile Plan,2026-07-31,2026-07-31,29.99,5.7,0.0,false
+12,4,Vodafone,Mobile Plan,2026-08-30,2026-08-30,29.99,5.7,0.0,false
+13,5,McFit,Gym Membership,2026-07-01,2026-07-01,24.9,4.73,0.0,false
+14,5,McFit,Gym Membership,2026-07-31,2026-07-31,24.9,4.73,0.0,false
+15,5,McFit,Gym Membership,2026-08-30,2026-08-30,24.9,4.73,0.0,false
+16,6,JetBrains,All Products Pack,2026-07-01,2026-07-01,289.0,54.91,0.0,false

@@ -1,0 +1,41 @@
+version: 2
+
+models:
+  - name: int_date_spine
+    description: Contiguous daily spine across all log tables.
+    columns:
+      - name: date_day
+        data_tests: [unique, not_null]
+
+  - name: int_weight_trends
+    description: >
+      Reconstruction of the health.v_weight_trends view, which is referenced in
+      five places in health.sql but never defined there.
+    columns:
+      - name: log_date
+        data_tests: [unique, not_null]
+      - name: avg_3day_filled
+        description: >
+          Carried forward across gap days, so it is defined for every date on
+          the spine once the first weigh-in has happened.
+        data_tests: [not_null]
+
+  - name: int_activity_kcal
+    description: >
+      Step, strength and cycling calories per day. Reproduces the production
+      two-day step lag, and exposes the same-day figure beside it.
+    columns:
+      - name: date_day
+        data_tests: [unique, not_null]
+      - name: activity_kcal
+        data_tests: [not_null]
+
+  - name: int_calorie_targets
+    description: The arithmetic core of rpc_snapshot_daily_overview().
+    columns:
+      - name: date_day
+        data_tests: [unique, not_null]
+      - name: bmr_kcal
+        data_tests: [not_null]
+      - name: total_kcal_target
+        data_tests: [not_null]
