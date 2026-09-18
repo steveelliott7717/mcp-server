@@ -492,7 +492,8 @@ app.use((req, res, next) => {
     // an attacker). Authenticated clients still get it via GET /tools (they
     // pass the gate) or, normally, tools/list over /sse.
     if (req.path.startsWith('/sse-readonly') ||
-        req.path === '/health' || req.path === '/gpt/health') {
+        req.path === '/health' || req.path === '/gpt/health' ||
+        req.path === '/shortcuts/alditalk-otp') {   // checks its own ALDITALK_OTP_TOKEN
         return next();
     }
 
@@ -5886,6 +5887,47 @@ app.post("/edit/perform_safe", async (req, res) => {
     }
 });
 
+
+
+/* ========================= Shortcuts: ALDI TALK OTP relay =========================
+   POST /shortcuts/alditalk-otp
+   Headers:
+     Authorization: Bearer <ALDITALK_OTP_TOKEN>
+   Body:
+     { "text": "<full SMS text>" }   (JSON, or the raw SMS as text/plain)
+   An iPhone Shortcuts automation forwards ALDI's booking-confirmation SMS here;
+   alditalk/cron_alditalk_topup.js picks the code up from the inbox file while
+   its browser waits on the OTP popup. Codes live 2 minutes, so no storage beyond
+   the latest one. Own token, not the master one: the phone holds only this.
+===================================================================================== */
+
+const ALDITALK_OTP_INBOX = '/opt/supabase-mcp/custom/alditalk/.otp_inbox';
+
+app.post('/shortcuts/alditalk-otp', (req, res) => {
+    const expected = process.env.ALDITALK_OTP_TOKEN || '';
+    const token = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+    if (!expected || !safeEqual(token, expected)) {
+        return res.status(401).json({ ok: false, error: 'Invalid token' });
+    }
+
+    const body = req.body;
+    const text = String(typeof body === 'string' ? body : (body && (body.text || body.message)) || '');
+    if (!/ALDI\s*TALK/i.test(text)) {
+        return res.status(400).json({ ok: false, error: 'not an ALDI TALK message' });
+    }
+    const m = text.match(/Best(?:ä|ae)tigungscode:?\s*(\d{4,8})/i);
+    if (!m) {
+        return res.status(400).json({ ok: false, error: 'no Bestätigungscode found' });
+    }
+
+    try {
+        fs.writeFileSync(ALDITALK_OTP_INBOX, JSON.stringify({ code: m[1], received_at: new Date().toISOString() }));
+    } catch (err) {
+        console.error('[ALDITALK OTP] inbox write failed:', err.message);
+        return res.status(500).json({ ok: false, error: 'inbox write failed' });
+    }
+    res.json({ ok: true });
+});
 
 
 /* ========================= Shortcuts: Steps ingest (update-then-insert) =========================

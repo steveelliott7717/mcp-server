@@ -9,5 +9,11 @@ poshmark/session.json
 poshmark/login_error.png
 wg/session.json
 wg/*.png
+alditalk/session.json
+alditalk/cookies_*.json
+alditalk/build_session.js
+alditalk/*.png
 wg_messages_rows.json
 *.bak-*
+alditalk/.otp_inbox
+alditalk/.session_dead
