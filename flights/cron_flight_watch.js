@@ -21,6 +21,11 @@
 //  * price_insights (Google's "typical range") was absent on a multi-origin search
 //    seven months out. Stored when present, otherwise null; alert rules fall back
 //    to the watch's own history and target_price.
+//  * show_hidden=true ("View more flights") returns ~190 itineraries instead of
+//    ~11 for the same single credit (~330 KB, ~20–40 KB once Postgres compresses
+//    the jsonb). It is not a strict superset: on 12→26 May it dropped the 30 h
+//    Air India fare the default view had. Every itinerary stays queryable through
+//    the finance.flight_options view, which unpacks `raw` on read.
 //
 // Flags: --dry-run (search, print, write nothing)  --limit N (cap searches this run)
 
@@ -102,6 +107,7 @@ async function serpSearch(watch, outboundDate, returnDate) {
         currency: watch.currency || "EUR",
         hl: "en",
         gl: "de",
+        show_hidden: "true",
         api_key: SERPAPI_KEY,
     });
     if (returnDate) p.set("return_date", returnDate);
