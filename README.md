@@ -86,6 +86,8 @@ Each module has its own cron scripts running via system crontab with `flock` loc
 
 **Poshmark** — Playwright-based closet sharing and sales notification monitoring.
 
+**Flight watch** — Daily price intake for trips defined in `finance.flight_watches` (one row per trip: origin/destination airports, outbound and return date windows, max stops, optional target). `flights/cron_flight_watch.js` pulls live Google Flights results through SerpApi (free tier, 250 searches/month), budgets today's searches from what the plan has left, splits them across active watches, rotates through the least-recently-checked date combinations, and records the cheapest itinerary per search in `finance.flight_price_checks` (with the full response in `raw`). Alert rules (target price, Google's typical range, 30-day median, new low) are evaluated into `alert_reason` on every row; a Pushover alert is only sent when `FLIGHT_NOTIFY=true`.
+
 **Facebook** — Marketplace listing ingestion and notifications.
 
 **Embeddings** — Cron-based embedding generation for professional profile and genealogy documents with quota management and retry logic.
