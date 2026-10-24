@@ -34,8 +34,12 @@ dotenv.config({ path: "/opt/supabase-mcp/custom/.env" });
 
 import { callTool } from "./mcp.js";
 
-const SERPAPI_KEY = process.env.SERPAPI_KEY;
-const RESERVE = Number(process.env.FLIGHT_SEARCH_RESERVE ?? 10);       // credits kept back each month
+// SERPAPI_KEY plus any SERPAPI_KEY_2, SERPAPI_KEY_3, … — one per SerpApi account.
+const SERPAPI_KEYS = [...new Set(Object.entries(process.env)
+    .filter(([k, v]) => /^SERPAPI_KEY(_\d+)?$/.test(k) && v && v.trim())
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+    .map(([, v]) => v.trim().replace(/^["']|["']$/g, "")))];
+const RESERVE = Number(process.env.FLIGHT_SEARCH_RESERVE ?? 10);       // credits kept back per account each month
 const HARD_CAP = Number(process.env.FLIGHT_MAX_SEARCHES_PER_RUN ?? 12); // never more than this per run
 const NOTIFY = String(process.env.FLIGHT_NOTIFY || "").toLowerCase() === "true";
 const NOTIFY_CATEGORY = process.env.FLIGHT_NOTIFY_CATEGORY || "purchases";
@@ -77,12 +81,39 @@ async function queryRows(args) {
 
 // ---------------------------------------------------------------- SerpApi
 
-async function serpAccount() {
-    const res = await fetch(`https://serpapi.com/account.json?api_key=${encodeURIComponent(SERPAPI_KEY)}`);
+const keyTag = (key) => `…${key.slice(-4)}`;
+
+async function serpAccount(key) {
+    const res = await fetch(`https://serpapi.com/account.json?api_key=${encodeURIComponent(key)}`);
     if (!res.ok) throw new Error(`SerpApi account check failed: ${res.status}`);
     const a = await res.json();
     if (a.error) throw new Error(`SerpApi account check: ${a.error}`);
     return a;
+}
+
+/** Today's share per account, from what each has left and its own plan month. */
+async function loadAccounts(now) {
+    const accounts = [];
+    for (const key of SERPAPI_KEYS) {
+        try {
+            const a = await serpAccount(key);
+            const left = Number(a.total_searches_left ?? a.plan_searches_left ?? 0);
+            const daysLeft = daysLeftInPlan(a, now);
+            const share = Math.max(0, Math.floor((left - RESERVE) / daysLeft));
+            accounts.push({ key, left, daysLeft, share, used: 0, dead: false });
+            log(`SerpApi ${keyTag(key)}: ${a.plan_name || "?"}, ${left} left, ${daysLeft} day(s) to renewal → share today ${share}`);
+        } catch (err) {
+            log(`SerpApi ${keyTag(key)}: skipped — ${err.message}`);
+        }
+    }
+    return accounts;
+}
+
+/** The live account with the most of today's share still unused. */
+function pickAccount(accounts) {
+    const live = accounts.filter(a => !a.dead && a.used < a.share);
+    if (!live.length) return null;
+    return live.reduce((a, b) => (b.share - b.used > a.share - a.used ? b : a));
 }
 
 /** stops → SerpApi's encoding: 0 nonstop only, 1 → ≤1 stop, 2 → ≤2 stops, else any. */
@@ -94,7 +125,7 @@ function stopsParam(maxStops) {
 }
 const CLASS_PARAM = { economy: "1", premium_economy: "2", business: "3", first: "4" };
 
-async function serpSearch(watch, outboundDate, returnDate) {
+async function serpSearch(watch, outboundDate, returnDate, apiKey) {
     const p = new URLSearchParams({
         engine: "google_flights",
         departure_id: watch.origins.join(","),
@@ -108,7 +139,7 @@ async function serpSearch(watch, outboundDate, returnDate) {
         hl: "en",
         gl: "de",
         show_hidden: "true",
-        api_key: SERPAPI_KEY,
+        api_key: apiKey,
     });
     if (returnDate) p.set("return_date", returnDate);
     const res = await fetch(`https://serpapi.com/search.json?${p}`, { signal: AbortSignal.timeout(90000) });
@@ -237,16 +268,15 @@ async function main() {
     const now = new Date();
     const today = isoDate(now);
     log(`start ${now.toISOString()} dry_run=${DRY_RUN} notify=${NOTIFY}`);
-    if (!SERPAPI_KEY) { log("Fatal: SERPAPI_KEY not set"); process.exit(1); }
+    if (!SERPAPI_KEYS.length) { log("Fatal: no SERPAPI_KEY set"); process.exit(1); }
 
-    // 1. Budget for today.
-    const account = await serpAccount();
-    const left = Number(account.total_searches_left ?? account.plan_searches_left ?? 0);
-    const daysLeft = daysLeftInPlan(account, now);
-    let budget = Math.max(0, Math.floor((left - RESERVE) / daysLeft));
+    // 1. Budget for today: the sum of each account's share, then the caps.
+    const accounts = await loadAccounts(now);
+    const left = accounts.reduce((s, a) => s + a.left, 0);
+    let budget = accounts.reduce((s, a) => s + a.share, 0);
     budget = Math.min(budget, HARD_CAP);
     if (LIMIT != null) budget = Math.min(budget, LIMIT);
-    log(`SerpApi: ${left} searches left, ${daysLeft} day(s) in plan month → budget today ${budget} (reserve ${RESERVE}, cap ${HARD_CAP})`);
+    log(`SerpApi: ${accounts.length}/${SERPAPI_KEYS.length} account(s) usable, ${left} searches left in total → budget today ${budget} (reserve ${RESERVE}/account, cap ${HARD_CAP})`);
 
     // 2. Active watches.
     const watches = await queryRows({
@@ -294,15 +324,25 @@ async function main() {
         for (const combo of p.ranked.slice(0, p.take)) {
             const when = combo.return_date ? `${combo.outbound_date}→${combo.return_date}` : combo.outbound_date;
             let body, summary;
-            try {
-                body = await serpSearch(w, combo.outbound_date, combo.return_date);
-                searches++;
-                summary = summarize(body);
-            } catch (err) {
-                failures++;
-                log(`#${w.id} ${when}: ❌ ${err.message}`);
+            // Try the account with the most share left; if it errors, retire it
+            // for this run and try the next one.
+            for (let acct = pickAccount(accounts); acct; acct = pickAccount(accounts)) {
+                try {
+                    body = await serpSearch(w, combo.outbound_date, combo.return_date, acct.key);
+                    acct.used++;
+                    searches++;
+                    break;
+                } catch (err) {
+                    failures++;
+                    acct.dead = true;
+                    log(`#${w.id} ${when}: ❌ ${keyTag(acct.key)} ${err.message} — retiring this key for the run`);
+                }
+            }
+            if (!body) {
+                log(`#${w.id} ${when}: no usable SerpApi account left`);
                 continue;
             }
+            summary = summarize(body);
             if (!summary) {
                 log(`#${w.id} ${when}: no priced itineraries returned`);
                 if (!DRY_RUN) await recordCheck(w, combo, null, body, []);
@@ -331,7 +371,8 @@ async function main() {
         }
     }
 
-    finish({ budget, searches, inserted, alerts, failures, left_after: left - searches });
+    finish({ budget, searches, inserted, alerts, failures, left_after: left - searches,
+        per_account: Object.fromEntries(accounts.map(a => [keyTag(a.key), a.used])) });
 }
 
 async function recordCheck(w, combo, summary, body, reasons, alerted = false) {
