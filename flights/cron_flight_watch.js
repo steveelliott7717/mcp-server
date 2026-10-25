@@ -9,7 +9,7 @@
 // searches/month) is asked how many searches it has left (that call is free).
 // Each account's daily share is (left − RESERVE) / days to its renewal; the sum is
 // the day's budget, divided over the day's scheduled runs (see Schedule), and each
-// run splits its part equally across the active watches. Within a watch the
+// run splits its part across the active watches by `priority`. Within a watch the
 // searches go to the date combinations checked longest ago, so every combination
 // gets covered in turn.
 //
@@ -224,13 +224,21 @@ function* eachDate(from, to) {
 }
 const nightsBetween = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000);
 
-/** Every (outbound, return) pair a watch asks for, excluding dates already past. */
+/** An explicit date list when the watch has one, else every day of the range. */
+function datesFor(list, from, to) {
+    if (Array.isArray(list) && list.length) return [...new Set(list.map(d => String(d).slice(0, 10)))].sort();
+    return from ? [...eachDate(from, to)] : [];
+}
+
+/** Every (outbound, return) pair a watch asks for, excluding dates already past.
+ *  outbound_dates / return_dates, when set, replace the from–to ranges. */
 function combinations(watch, today) {
     const out = [];
-    for (const o of eachDate(watch.outbound_from, watch.outbound_to)) {
+    const returns = datesFor(watch.return_dates, watch.return_from, watch.return_to);
+    for (const o of datesFor(watch.outbound_dates, watch.outbound_from, watch.outbound_to)) {
         if (o <= today) continue;
-        if (!watch.return_from) { out.push({ outbound_date: o, return_date: null }); continue; }
-        for (const r of eachDate(watch.return_from, watch.return_to)) {
+        if (!returns.length) { out.push({ outbound_date: o, return_date: null }); continue; }
+        for (const r of returns) {
             const n = nightsBetween(o, r);
             if (n < 1) continue;
             if (watch.min_nights != null && n < watch.min_nights) continue;
@@ -364,11 +372,14 @@ async function main() {
         plans.push({ watch: w, ranked, history, take: 0 });
     }
 
-    // 4. Split today's budget: equal shares, capped per watch, leftover to the stalest.
+    // 4. Split this run's budget by priority (equal when all are 1), capped per
+    //    watch, leftover to the stalest.
     const active = plans.filter(p => p.ranked.length);
+    const weight = (p) => Math.max(0, Number(p.watch.priority ?? 1));
+    const totalWeight = active.reduce((s, p) => s + weight(p), 0) || 1;
     let remaining = budget;
     for (const p of active) {
-        p.take = Math.min(Math.floor(budget / active.length), p.watch.max_searches_per_run ?? Infinity, p.ranked.length);
+        p.take = Math.min(Math.floor(budget * weight(p) / totalWeight), p.watch.max_searches_per_run ?? Infinity, p.ranked.length);
         remaining -= p.take;
     }
     while (remaining > 0) {
