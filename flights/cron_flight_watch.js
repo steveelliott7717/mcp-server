@@ -5,11 +5,13 @@
 // search. Alerts are evaluated and written to alert_reason on every row, but a
 // push is only sent when FLIGHT_NOTIFY=true — until then this is intake only.
 //
-// Budget: the free SerpApi plan is 250 searches/month. Each run asks SerpApi how
-// many are left (that call is free), keeps RESERVE back for manual checks, spreads
-// the rest over the days left in the plan month, and splits today's share equally
-// across the active watches. Within a watch the searches go to the date
-// combinations checked longest ago, so every combination gets covered in turn.
+// Budget: each SerpApi account (SERPAPI_KEY, SERPAPI_KEY_2, …; free plan = 250
+// searches/month) is asked how many searches it has left (that call is free).
+// Each account's daily share is (left − RESERVE) / days to its renewal; the sum is
+// the day's budget, divided over the day's scheduled runs (see Schedule), and each
+// run splits its part equally across the active watches. Within a watch the
+// searches go to the date combinations checked longest ago, so every combination
+// gets covered in turn.
 //
 // Notes earned on the first real calls (2026-10-24):
 //  * departure_id/arrival_id accept comma-separated lists, so one search covers
@@ -27,12 +29,28 @@
 //    Air India fare the default view had. Every itinerary stays queryable through
 //    the finance.flight_options view, which unpacks `raw` on read.
 //
+// Schedule: cron starts this every 15 minutes; it only works when one of the
+// FLIGHT_RUN_TIMES (Berlin local, e.g. "07:00,13:00,19:00") has come due and has
+// not run yet today, and exits silently otherwise — so the times live in .env,
+// not in the crontab. The day's budget is fixed at the first run of the Berlin
+// day and divided over the runs still to come; state is kept in .run_state.json.
+// A slot missed while the server was down is skipped, its share rolls onward.
+//
 // Flags: --dry-run (search, print, write nothing)  --limit N (cap searches this run)
+//        --force (run now regardless of the schedule; counts against today's budget)
 
 import dotenv from "dotenv";
 dotenv.config({ path: "/opt/supabase-mcp/custom/.env" });
 
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { callTool } from "./mcp.js";
+
+const STATE_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".run_state.json");
+const RUN_TIMES = String(process.env.FLIGHT_RUN_TIMES || "07:00")
+    .split(",").map(s => s.trim()).filter(s => /^\d{1,2}:\d{2}$/.test(s))
+    .map(s => s.padStart(5, "0")).sort();
 
 // SERPAPI_KEY plus any SERPAPI_KEY_2, SERPAPI_KEY_3, … — one per SerpApi account.
 const SERPAPI_KEYS = [...new Set(Object.entries(process.env)
@@ -48,6 +66,7 @@ const BELOW_MEDIAN_PCT = 15;    // alert when this far under the 30-day median
 
 const argv = process.argv.slice(2);
 const DRY_RUN = argv.includes("--dry-run");
+const FORCE = argv.includes("--force");
 const LIMIT = argv.includes("--limit") ? Number(argv[argv.indexOf("--limit") + 1]) : null;
 
 const runId = Date.now().toString(36);
@@ -109,11 +128,35 @@ async function loadAccounts(now) {
     return accounts;
 }
 
-/** The live account with the most of today's share still unused. */
+/** The live account with the most searches left above its reserve. */
 function pickAccount(accounts) {
-    const live = accounts.filter(a => !a.dead && a.used < a.share);
+    const live = accounts.filter(a => !a.dead && a.left - a.used > RESERVE);
     if (!live.length) return null;
-    return live.reduce((a, b) => (b.share - b.used > a.share - a.used ? b : a));
+    return live.reduce((a, b) => (b.left - b.used > a.left - a.used ? b : a));
+}
+
+// ---------------------------------------------------------------- schedule
+
+/** Berlin-local date and HH:MM for an instant. */
+function berlinClock(d) {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Europe/Berlin", year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).formatToParts(d).map(p => [p.type, p.value]));
+    return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
+}
+
+function loadState(date) {
+    try {
+        const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+        if (s.date === date) return s;
+    } catch { /* first run or unreadable — start fresh */ }
+    return { date, daily_budget: null, used: 0, done: [] };
+}
+
+function saveState(state) {
+    if (DRY_RUN) return;
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 /** stops → SerpApi's encoding: 0 nonstop only, 1 → ≤1 stop, 2 → ≤2 stops, else any. */
@@ -267,16 +310,37 @@ async function pushAlert(watch, combo, summary, reasons) {
 async function main() {
     const now = new Date();
     const today = isoDate(now);
-    log(`start ${now.toISOString()} dry_run=${DRY_RUN} notify=${NOTIFY}`);
+
+    // 0. Is a scheduled run due? Silent exit if not, so the 15-minute cron
+    //    doesn't fill the log.
+    const clock = berlinClock(now);
+    const state = loadState(clock.date);
+    const passed = RUN_TIMES.filter(t => t <= clock.time);
+    const due = passed.filter(t => !state.done.includes(t)).pop() || null;
+    if (!due && !FORCE) return;
+
+    log(`start ${now.toISOString()} (Berlin ${clock.date} ${clock.time}, slot ${due ?? "forced"}) dry_run=${DRY_RUN} notify=${NOTIFY}`);
     if (!SERPAPI_KEYS.length) { log("Fatal: no SERPAPI_KEY set"); process.exit(1); }
 
-    // 1. Budget for today: the sum of each account's share, then the caps.
+    // Claim the slot (and any earlier ones missed today) before spending anything,
+    // so a crash mid-run cannot make the next tick repeat it.
+    if (due) { state.done = [...new Set([...state.done, ...passed])]; saveState(state); }
+
+    // 1. Budget: the day's total is fixed at the first run of the Berlin day from
+    //    each account's share; each run takes what's unused divided by the runs
+    //    still to come (this one included), then the caps.
     const accounts = await loadAccounts(now);
     const left = accounts.reduce((s, a) => s + a.left, 0);
-    let budget = accounts.reduce((s, a) => s + a.share, 0);
+    if (state.daily_budget == null) {
+        state.daily_budget = accounts.reduce((s, a) => s + a.share, 0);
+        saveState(state);
+    }
+    const runsLeft = Math.max(1, RUN_TIMES.filter(t => t > clock.time).length + 1);
+    let budget = Math.max(0, Math.floor((state.daily_budget - state.used) / runsLeft));
     budget = Math.min(budget, HARD_CAP);
     if (LIMIT != null) budget = Math.min(budget, LIMIT);
-    log(`SerpApi: ${accounts.length}/${SERPAPI_KEYS.length} account(s) usable, ${left} searches left in total → budget today ${budget} (reserve ${RESERVE}/account, cap ${HARD_CAP})`);
+    log(`SerpApi: ${accounts.length}/${SERPAPI_KEYS.length} account(s) usable, ${left} left in total · today ${state.used}/${state.daily_budget} used · `
+        + `${runsLeft} run(s) left today (${RUN_TIMES.join(", ")} Berlin) → this run ${budget} (reserve ${RESERVE}/account, cap ${HARD_CAP})`);
 
     // 2. Active watches.
     const watches = await queryRows({
@@ -331,6 +395,8 @@ async function main() {
                     body = await serpSearch(w, combo.outbound_date, combo.return_date, acct.key);
                     acct.used++;
                     searches++;
+                    state.used++;
+                    saveState(state);
                     break;
                 } catch (err) {
                     failures++;
@@ -371,7 +437,8 @@ async function main() {
         }
     }
 
-    finish({ budget, searches, inserted, alerts, failures, left_after: left - searches,
+    finish({ slot: due ?? "forced", budget, searches, inserted, alerts, failures, left_after: left - searches,
+        today_used: state.used, today_budget: state.daily_budget,
         per_account: Object.fromEntries(accounts.map(a => [keyTag(a.key), a.used])) });
 }
 
