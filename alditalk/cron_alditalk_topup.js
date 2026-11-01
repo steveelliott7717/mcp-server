@@ -201,15 +201,21 @@ async function run() {
                 // token itself has expired. Push once, then stay quiet.
                 if (!fs.existsSync(DEAD_FLAG)) {
                     try {
-                        await callTool("notify_push", {
+                        const res = await callTool("notify_push", {
                             provider: "pushover",
-                            category: "alditalk",
+                            category: "quick",
                             title: "📶 ALDI TALK remember-me expired",
                             message: "The 'Angemeldet bleiben' token was rejected. Log in again with the box ticked, "
                                 + "re-capture the login.alditalk-kundenbetreuung.de Cookie header, and re-run build_session.js. "
                                 + "Top-ups are paused until then.",
                             no_log: true,
                         });
+                        // A rejected push comes back as a result, not a throw — only
+                        // set the flag once the push really went out.
+                        const text = res?.result?.content?.[0]?.text ?? res?.content?.[0]?.text ?? "";
+                        if (res?.error || res?.result?.isError || !/"ok":\s*true/.test(text)) {
+                            throw new Error((text || JSON.stringify(res?.error ?? res)).slice(0, 300));
+                        }
                         fs.writeFileSync(DEAD_FLAG, new Date().toISOString());
                         console.error(`[${runId}] pushed expiry notification (once)`);
                     } catch (e) {
