@@ -59,8 +59,13 @@ const SERPAPI_KEYS = [...new Set(Object.entries(process.env)
     .map(([, v]) => v.trim().replace(/^["']|["']$/g, "")))];
 const RESERVE = Number(process.env.FLIGHT_SEARCH_RESERVE ?? 10);       // credits kept back per account each month
 const HARD_CAP = Number(process.env.FLIGHT_MAX_SEARCHES_PER_RUN ?? 12); // never more than this per run
+const BUDGET_MULT = Number(process.env.FLIGHT_BUDGET_MULTIPLIER ?? 1);  // temporary boost; >1 overspends the monthly pace
+const NO_CACHE = String(process.env.FLIGHT_NO_CACHE || "").toLowerCase() === "true"; // SerpApi serves repeats <1 h old from cache otherwise
 const NOTIFY = String(process.env.FLIGHT_NOTIFY || "").toLowerCase() === "true";
 const NOTIFY_CATEGORY = process.env.FLIGHT_NOTIFY_CATEGORY || "purchases";
+const STEP_ALERT = String(process.env.FLIGHT_STEP_ALERT || "").toLowerCase() === "true";
+const STEP_EUR = Number(process.env.FLIGHT_STEP_EUR ?? 15);
+const STEP_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), ".step_state.json");
 const HISTORY_DAYS = 30;        // window for the "below median" rule
 const BELOW_MEDIAN_PCT = 15;    // alert when this far under the 30-day median
 
@@ -185,6 +190,7 @@ async function serpSearch(watch, outboundDate, returnDate, apiKey) {
         api_key: apiKey,
     });
     if (returnDate) p.set("return_date", returnDate);
+    if (NO_CACHE) p.set("no_cache", "true");
     const res = await fetch(`https://serpapi.com/search.json?${p}`, { signal: AbortSignal.timeout(90000) });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.error) throw new Error(`SerpApi ${res.status}: ${body.error || "unknown error"}`);
@@ -313,6 +319,71 @@ async function pushAlert(watch, combo, summary, reasons) {
     toolJson(res, "notify_push");   // throws if the server rejected it
 }
 
+// ---------------------------------------------------------------- step alerts
+//
+// FLIGHT_STEP_ALERT=true: independent of FLIGHT_NOTIFY, push when the cheapest
+// nonstop price of a date pair moves by FLIGHT_STEP_EUR or more from the level
+// last reported (the first sighting is the baseline), or when the nonstop stops
+// being offered. One push per run, listing every pair that moved; levels live
+// in .step_state.json so a price that stays put is reported once.
+
+/** Cheapest nonstop round-trip price in a response, or null if none is offered. */
+function cheapestDirect(body) {
+    const prices = [...(body.best_flights || []), ...(body.other_flights || [])]
+        .filter(f => (f.flights || []).length === 1 && Number.isFinite(Number(f.price)))
+        .map(f => Number(f.price));
+    return prices.length ? Math.min(...prices) : null;
+}
+
+function loadSteps() {
+    try { return JSON.parse(fs.readFileSync(STEP_FILE, "utf8")); } catch { return {}; }
+}
+
+const stepKey = (w, c) => `${w.id}|${c.outbound_date}|${c.return_date ?? ""}`;
+
+function noteStep(steps, events, w, combo, direct) {
+    const key = stepKey(w, combo);
+    const s = steps[key];
+    if (!s) { steps[key] = { level: direct, last: direct }; return; }
+    const moved = s.level == null ? direct != null : direct == null || Math.abs(direct - s.level) >= STEP_EUR;
+    if (moved) {
+        events.push({ w, combo, key, from: s.level, to: direct });
+        if (direct == null || (s.level != null && direct > s.level)) s.rose_at = Date.now();
+        s.level = direct;
+    }
+    s.last = direct;
+}
+
+async function pushSteps(events, steps, plans) {
+    const day = d => new Date(`${d}T00:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+    const pair = c => c.return_date ? `${day(c.outbound_date)} → ${day(c.return_date)}` : day(c.outbound_date);
+    const eur = v => v == null ? "none" : `€${v}`;
+    const lines = events.map(e => `${pair(e.combo)}: direct ${eur(e.from)} → ${eur(e.to)}`
+        + (e.from != null && e.to != null ? ` (${e.to > e.from ? "+" : "−"}€${Math.abs(e.to - e.from)})` : ""));
+    const rose = events.filter(e => e.to == null || (e.from != null && e.to > e.from));
+    // Pairs are spread over several runs when the budget is tight, so "rose
+    // together" means every return for that outbound rose within the last hour.
+    const roseRecently = (w, c) => Date.now() - (steps[stepKey(w, c)]?.rose_at ?? 0) < 60 * 60 * 1000;
+    for (const p of plans) {
+        const moved = new Set(events.filter(e => e.w.id === p.watch.id).map(e => e.key));
+        const still = p.ranked.filter(c => !moved.has(stepKey(p.watch, c)) && steps[stepKey(p.watch, c)]);
+        if (still.length) lines.push(`Unchanged: ${still.map(c => `${pair(c)} ${eur(steps[stepKey(p.watch, c)].last)}`).join(", ")}`);
+        const byOut = Object.groupBy(p.ranked, c => c.outbound_date);
+        for (const [out, combos] of Object.entries(byOut)) {
+            if (combos.length > 1 && combos.some(c => rose.some(e => e.key === stepKey(p.watch, c)))
+                && combos.every(c => roseRecently(p.watch, c)))
+                lines.push(`All returns with ${day(out)} out rose together — likely the outbound fare.`);
+        }
+    }
+    const first = events[0];
+    const title = `✈️ ${first.w.label}: direct ${rose.length ? "up" : "down"} — ${pair(first.combo)} ${eur(first.to)}`
+        + (events.length > 1 ? ` (+${events.length - 1} more)` : "");
+    toolJson(await callTool("notify_push", {
+        provider: "pushover", category: NOTIFY_CATEGORY, title, body: lines.join("\n"),
+    }), "notify_push");
+    log(`step alert pushed: ${lines.join(" | ")}`);
+}
+
 // ---------------------------------------------------------------- main
 
 async function main() {
@@ -343,11 +414,13 @@ async function main() {
         state.daily_budget = accounts.reduce((s, a) => s + a.share, 0);
         saveState(state);
     }
+    const dayBudget = Math.floor(state.daily_budget * BUDGET_MULT);
     const runsLeft = Math.max(1, RUN_TIMES.filter(t => t > clock.time).length + 1);
-    let budget = Math.max(0, Math.floor((state.daily_budget - state.used) / runsLeft));
+    let budget = Math.max(0, Math.floor((dayBudget - state.used) / runsLeft));
     budget = Math.min(budget, HARD_CAP);
     if (LIMIT != null) budget = Math.min(budget, LIMIT);
-    log(`SerpApi: ${accounts.length}/${SERPAPI_KEYS.length} account(s) usable, ${left} left in total · today ${state.used}/${state.daily_budget} used · `
+    log(`SerpApi: ${accounts.length}/${SERPAPI_KEYS.length} account(s) usable, ${left} left in total · today ${state.used}/${dayBudget} used`
+        + (BUDGET_MULT !== 1 ? ` (×${BUDGET_MULT} of ${state.daily_budget})` : "") + " · "
         + `${runsLeft} run(s) left today (${RUN_TIMES.join(", ")} Berlin) → this run ${budget} (reserve ${RESERVE}/account, cap ${HARD_CAP})`);
 
     // 2. Active watches.
@@ -394,6 +467,8 @@ async function main() {
 
     // 5. Search, record, evaluate.
     let searches = 0, inserted = 0, alerts = 0, failures = 0;
+    const steps = STEP_ALERT ? loadSteps() : {};
+    const stepEvents = [];
     for (const p of active) {
         const w = p.watch;
         for (const combo of p.ranked.slice(0, p.take)) {
@@ -419,6 +494,7 @@ async function main() {
                 log(`#${w.id} ${when}: no usable SerpApi account left`);
                 continue;
             }
+            if (STEP_ALERT && !DRY_RUN) noteStep(steps, stepEvents, w, combo, cheapestDirect(body));
             summary = summarize(body);
             if (!summary) {
                 log(`#${w.id} ${when}: no priced itineraries returned`);
@@ -448,8 +524,17 @@ async function main() {
         }
     }
 
+    if (stepEvents.length) {
+        try { await pushSteps(stepEvents, steps, active); alerts++; }
+        catch (err) {
+            log(`step alert push failed: ${err.message}`);
+            for (const e of stepEvents) steps[e.key].level = e.from;   // retry on the next run
+        }
+    }
+    if (STEP_ALERT && !DRY_RUN) fs.writeFileSync(STEP_FILE, JSON.stringify(steps, null, 2));
+
     finish({ slot: due ?? "forced", budget, searches, inserted, alerts, failures, left_after: left - searches,
-        today_used: state.used, today_budget: state.daily_budget,
+        today_used: state.used, today_budget: Math.floor(state.daily_budget * BUDGET_MULT),
         per_account: Object.fromEntries(accounts.map(a => [keyTag(a.key), a.used])) });
 }
 
