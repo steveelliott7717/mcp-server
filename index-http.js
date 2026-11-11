@@ -2687,7 +2687,10 @@ function toolsPayload(){
         options:{ type:'object', properties:{
           proxy:{type:'object'}, geolocation:{type:'object'}, timezone:{type:'string'}, locale:{type:'string'},
           user_agent:{type:'string'}, viewport:{type:'object'}, storage_state_in:{type:'string'}, storage_state_out:{type:'string'},
-          stealth:{type:'boolean'}, jitter_ms:{type:'number'}
+          stealth:{type:'boolean'}, jitter_ms:{type:'number'},
+          keep_open:{type:'boolean', description:'Keep the browser alive after the steps; result returns session_id (auto-closes after 10 min idle, max 3 open)'},
+          session_id:{type:'string', description:'Run the steps in an existing kept-open session (same page, same state)'},
+          close:{type:'boolean', description:'With session_id: close the session after running the steps'}
         }}
       }, required:['steps']
     }}
@@ -5558,9 +5561,54 @@ function denyLocal(urlStr){
   }
 }
 
+// Persistent browser sessions: lets a long job (e.g. a slow search) span several
+// tool calls, each under the MCP client's ~60s per-call timeout.
+// options.keep_open:true → browser stays alive, result carries session_id.
+// options.session_id:<id> → reuse that session's page. options.close:true → close it after the steps.
+const BROWSER_SESSIONS = new Map(); // id -> { browser, context, page, timer }
+const BROWSER_SESSION_IDLE_MS = 10 * 60 * 1000;
+const BROWSER_SESSION_MAX = 3;
+async function closeBrowserSession(id) {
+    const s = BROWSER_SESSIONS.get(id);
+    if (!s) return false;
+    BROWSER_SESSIONS.delete(id);
+    clearTimeout(s.timer);
+    try { await s.browser.close(); } catch {}
+    console.error(`[browser_flow] session ${id} closed`);
+    return true;
+}
+function touchBrowserSession(id) {
+    const s = BROWSER_SESSIONS.get(id);
+    if (!s) return;
+    clearTimeout(s.timer);
+    s.timer = setTimeout(() => { closeBrowserSession(id); }, BROWSER_SESSION_IDLE_MS);
+    s.timer.unref?.();
+}
+
 async function tool_browser_flow(args) {
     const { steps = [], options = {} } = args || {};
-    if (!Array.isArray(steps) || !steps.length) throw new Error('steps[] is required');
+    const sessionId = options.session_id ? String(options.session_id) : null;
+
+    // Reuse an existing session
+    if (sessionId) {
+        const s = BROWSER_SESSIONS.get(sessionId);
+        if (!s) throw new Error(`browser session ${sessionId} not found (expired after 10 min idle, or closed)`);
+        touchBrowserSession(sessionId);
+        let out;
+        try {
+            out = await runBrowserSteps(s.page, s.context, steps, options);
+        } finally {
+            if (options.close) await closeBrowserSession(sessionId);
+            else touchBrowserSession(sessionId);
+        }
+        return asJsonContent({ ok: true, session_id: sessionId, session_open: !options.close, results: out, url: options.close ? undefined : s.page.url() });
+    }
+
+    if (!Array.isArray(steps)) throw new Error('steps[] must be an array');
+    if (!steps.length && !options.keep_open) throw new Error('steps[] is required');
+    if (options.keep_open && BROWSER_SESSIONS.size >= BROWSER_SESSION_MAX) {
+        throw new Error(`too many open browser sessions (${BROWSER_SESSION_MAX}); close one with options.session_id + options.close:true`);
+    }
 
     const pw = await loadPlaywright();
     // Let playwright auto-select the headless shell (lighter binary, no zygote/GPU process)
@@ -5601,10 +5649,37 @@ async function tool_browser_flow(args) {
     }
 
     const page = await context.newPage();
+
+    if (options.keep_open) {
+        const id = crypto.randomUUID().slice(0, 8);
+        BROWSER_SESSIONS.set(id, { browser, context, page, timer: null });
+        touchBrowserSession(id);
+        console.error(`[browser_flow] session ${id} opened`);
+        let out;
+        try {
+            out = await runBrowserSteps(page, context, steps, options);
+        } catch (e) {
+            // keep the session so the caller can inspect/recover; report the error
+            touchBrowserSession(id);
+            return asJsonContent({ ok: false, session_id: id, session_open: true, error: String(e?.message || e), url: page.url() });
+        }
+        touchBrowserSession(id);
+        return asJsonContent({ ok: true, session_id: id, session_open: true, results: out, url: page.url() });
+    }
+
+    let results;
+    try {
+        results = await runBrowserSteps(page, context, steps, options);
+    } finally {
+        await browser.close();
+    }
+    return asJsonContent({ ok: true, results });
+}
+
+async function runBrowserSteps(page, context, steps, options = {}) {
     const jitter = Number(options.jitter_ms || 0);
     const results = [];
-
-    try {
+    {
         for (const step of steps) {
             const op = (step.op || '').toLowerCase();
 
@@ -5770,12 +5845,8 @@ async function tool_browser_flow(args) {
             await context.storageState({ path: options.storage_state_out });
             results.push({ op: 'save_storage_state', path: options.storage_state_out });
         }
-
-    } finally {
-        await browser.close();
     }
-
-    return asJsonContent({ ok: true, results });
+    return results;
 }
 
 //////////////////////////////
