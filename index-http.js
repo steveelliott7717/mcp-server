@@ -5037,9 +5037,13 @@ async function tool_http_fetch(args){
 
   // Parse URL and safety checks
   const u = new URL(url);
-  const allowHosts = normalizeHostsList(allow_hosts?.length ? allow_hosts : FETCH_ALLOW_HOSTS);
-  const denyHosts  = normalizeHostsList(deny_hosts?.length  ? deny_hosts  : FETCH_DENY_HOSTS );
-  if (!hostAllowed(u.hostname, allowHosts, denyHosts)) throw new Error(`host not allowed: ${u.hostname}`);
+  // The .env lists are the ceiling: a per-call allow_hosts can only narrow
+  // HTTP_FETCH_ALLOW_HOSTS and a per-call deny_hosts only adds to the deny list.
+  const envAllow  = normalizeHostsList(FETCH_ALLOW_HOSTS);
+  const callAllow = normalizeHostsList(allow_hosts);
+  const denyHosts = [...normalizeHostsList(FETCH_DENY_HOSTS), ...normalizeHostsList(deny_hosts)];
+  const hostOk = (h) => hostAllowed(h, envAllow, denyHosts) && (!callAllow.length || callAllow.includes(h));
+  if (!hostOk(u.hostname)) throw new Error(`host not allowed: ${u.hostname}`);
 
   if (BROWSER_DENY_LOCALHOST) {
     if (u.hostname==='localhost' || isPrivateHost(u.hostname)) throw new Error('localhost/private IPs are blocked');
@@ -5107,7 +5111,7 @@ async function tool_http_fetch(args){
         if (!canRedirect(currentUrl, toUrl, redirect_policy, policyList)) throw new Error(`redirect blocked: ${toUrl}`);
         // Re-run the same safety checks as the initial URL on every hop
         const nextU = new URL(toUrl);
-        if (!hostAllowed(nextU.hostname, allowHosts, denyHosts)) throw new Error(`redirect host not allowed: ${nextU.hostname}`);
+        if (!hostOk(nextU.hostname)) throw new Error(`redirect host not allowed: ${nextU.hostname}`);
         if (BROWSER_DENY_LOCALHOST) {
           if (nextU.hostname === 'localhost' || isPrivateHost(nextU.hostname)) throw new Error('redirect to localhost/private IP blocked');
           const rip = await resolveHostIPs(nextU.hostname);
@@ -5214,7 +5218,8 @@ async function tool_http_fetch(args){
       if (paginate) {
         aggregatePages.push({ meta, bytesLen: bytes.length });
         const next = parseLinkNext(finalRes.headers.get('link'));
-        if (next && canRedirect(currentUrl, next, redirect_policy, normalizeHostsList(allow_redirect_hosts))) {
+        if (next && canRedirect(currentUrl, next, redirect_policy, normalizeHostsList(allow_redirect_hosts))
+            && hostOk(new URL(next, currentUrl).hostname)) {
           currentUrl=next; redirects++; if (redirects > 20) break; continue;
         }
       }
