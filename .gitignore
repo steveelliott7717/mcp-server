@@ -18,3 +18,4 @@ wg_messages_rows.json
 *.bak-*
 alditalk/.otp_inbox
 alditalk/.session_dead
+alditalk/.session_lapse_since

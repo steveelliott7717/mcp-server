@@ -53,6 +53,10 @@ const DEFAULT_THRESHOLD_KB = 1048576;   // 1 GB, if the account doesn't state on
 
 // Marker so a dead token pushes once, not every five minutes until re-seeded.
 const DEAD_FLAG = path.join(__dirname, ".session_dead");
+// When the current lapse began. A login redirect can clear by itself (26 min on
+// 2026-11-06, token still valid), so only a lapse outlasting LAPSE_ALERT_MS pushes.
+const LAPSE_SINCE = path.join(__dirname, ".session_lapse_since");
+const LAPSE_ALERT_MS = 45 * 60 * 1000;
 // Written by index-http.js /shortcuts/alditalk-otp. Codes are valid 2 minutes.
 const OTP_INBOX = path.join(__dirname, ".otp_inbox");
 const OTP_WAIT_MS = 100000;
@@ -196,9 +200,21 @@ async function run() {
             const renew = await withBrowser(null);
             if (!renew.ok) {
                 console.error(`[${runId}] ❌ ${renew.reason}`);
+                // A missing or unreadable timer starts over, so it can never block the alert for good.
+                let since = fs.existsSync(LAPSE_SINCE) ? Date.parse(fs.readFileSync(LAPSE_SINCE, "utf8").trim()) : NaN;
+                if (Number.isNaN(since)) {
+                    since = Date.now();
+                    fs.writeFileSync(LAPSE_SINCE, new Date(since).toISOString());
+                }
+                const lapsedMs = Date.now() - since;
+                if (lapsedMs < LAPSE_ALERT_MS) {
+                    console.error(`[${runId}] session lapsed for ${Math.round(lapsedMs / 60000)} min — top-ups paused, alert at ${LAPSE_ALERT_MS / 60000} min`);
+                    return;
+                }
                 console.error(`[${runId}] SESSION DEAD — re-export browser cookies and rebuild session.json; top-ups are paused until then`);
-                // The browser could not renew either, so the "Angemeldet bleiben"
-                // token itself has expired. Push once, then stay quiet.
+                // The browser has been unable to renew for the whole grace period,
+                // so the "Angemeldet bleiben" token has most likely expired. Push
+                // once, then stay quiet.
                 if (!fs.existsSync(DEAD_FLAG)) {
                     try {
                         const res = await callTool("notify_push", {
@@ -229,8 +245,9 @@ async function run() {
         }
 
         // Session is healthy — clear any prior dead-token marker so the next
-        // expiry notifies again.
+        // expiry notifies again, and restart the grace period.
         if (fs.existsSync(DEAD_FLAG)) { fs.unlinkSync(DEAD_FLAG); console.log(`[${runId}] session recovered — cleared dead flag`); }
+        if (fs.existsSync(LAPSE_SINCE)) { fs.unlinkSync(LAPSE_SINCE); console.log(`[${runId}] session recovered — lapse timer cleared`); }
 
         const offer = offers.subscribedOffers[0];
         const inland = (offer.pack || []).find(p => p.balanceAttributeReference === "dataGrantAmount");
