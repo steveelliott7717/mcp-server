@@ -2667,7 +2667,7 @@ function toolsPayload(){
       }, required:['title','body']
     }},
 
-    { name:'browser_flow', description:'Run a multi-step Playwright automation flow with context, stealth, artifacts', inputSchema:{
+    { name:'browser_flow', description:'Run a multi-step Playwright automation flow with context, stealth, artifacts. Ops: goto, click, fill, type, press, wait (=wait_for: selector and/or ms), wait_for_text, assert_text, extract, extract_all, evaluate, capture_network, read_network, screenshot, pdf, set_files. Unknown ops fail. A failing step returns ok:false with error, failed_step, a screenshot file path and capped page text', inputSchema:{
       type:'object',
       additionalProperties: true,
       properties:{
@@ -2679,6 +2679,14 @@ function toolsPayload(){
             delay_ms:{type:'number'}, wait_until:{type:'string', enum:['load','domcontentloaded','networkidle'], default:'load'},
             timeout_ms:{type:'number'}, full_page:{type:'boolean'}, path:{type:'string'}, format:{type:'string'},
             script:{type:'string'}, kind:{type:'string', enum:['text','html'], default:'text'},
+            ms:{type:'number'}, key:{type:'string'},
+            pattern:{type:'string', description:'wait_for_text/assert_text: regex source (or give literal `text`)'},
+            flags:{type:'string', description:'regex flags, default "i"'},
+            absent:{type:'boolean', description:'wait_for_text: wait until the text is gone'},
+            present:{type:'boolean', description:'assert_text: false = fail if the text IS there'},
+            limit:{type:'number'}, max_chars:{type:'number'},
+            url_pattern:{type:'string', description:'capture_network/read_network: regex on the request URL'},
+            max_body_bytes:{type:'number'}, include_body:{type:'boolean'}, min:{type:'number'}, require:{type:'boolean'},
             files:{oneOf:[{type:'string'},{type:'array'}]},
             destination:{type:'string', enum:['none','github','supabase_storage','supabase_table']},
             destination_opts:{type:'object'}
@@ -2688,6 +2696,7 @@ function toolsPayload(){
           proxy:{type:'object'}, geolocation:{type:'object'}, timezone:{type:'string'}, locale:{type:'string'},
           user_agent:{type:'string'}, viewport:{type:'object'}, storage_state_in:{type:'string'}, storage_state_out:{type:'string'},
           stealth:{type:'boolean'}, jitter_ms:{type:'number'},
+          budget_ms:{type:'number', description:'Time limit for this call (default 180000). On expiry the call returns ok:false with evidence'},
           keep_open:{type:'boolean', description:'Keep the browser alive after the steps; result returns session_id (auto-closes after 10 min idle, max 3 open)'},
           session_id:{type:'string', description:'Run the steps in an existing kept-open session (same page, same state)'},
           close:{type:'boolean', description:'With session_id: close the session after running the steps'}
@@ -5585,6 +5594,60 @@ function touchBrowserSession(id) {
     s.timer.unref?.();
 }
 
+// Per-call time limit (options.budget_ms). Crons call through flights/mcp.js with no
+// timeout of their own (Node gives up at 300 s), so a stuck page should fail first.
+const BROWSER_FLOW_BUDGET_MS = 180000;
+const BROWSER_FAIL_TEXT_CHARS = 8000;
+const BROWSER_FLOW_OPS = ['goto', 'navigate', 'click', 'fill', 'type', 'press', 'wait', 'wait_for', 'wait_for_text',
+    'assert_text', 'extract', 'extract_all', 'evaluate', 'screenshot', 'pdf', 'set_files', 'capture_network', 'read_network'];
+
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+
+// On failure: screenshot to a file (path only, never inline) + capped page text.
+async function browserFailureEvidence(page) {
+    const ev = { url: null, screenshot: null, page_text: null };
+    try { ev.url = page.url(); } catch {}
+    try {
+        const file = path.join(os.tmpdir(), `browser_flow-fail-${Date.now()}.png`);
+        await page.screenshot({ path: file, timeout: 5000 });
+        ev.screenshot = file;
+    } catch {}
+    try {
+        const t = await withTimeout(page.evaluate(() => (document.body ? document.body.innerText : '')), 5000);
+        ev.page_text = String(t).slice(0, BROWSER_FAIL_TEXT_CHARS);
+    } catch {}
+    return ev;
+}
+
+// Runs the steps under the time budget. Step failures don't throw: they come back as
+// { ok:false, error, failed_step, failed_op, results (steps done so far), url, screenshot, page_text }.
+// `error` leads with the cause, then the step, then the screenshot path, so a caller that
+// keeps only the first few hundred characters still has what matters.
+async function runBrowserFlowGuarded(page, context, steps, options) {
+    const budget = Number(options.budget_ms) > 0 ? Number(options.budget_ms) : BROWSER_FLOW_BUDGET_MS;
+    const progress = { results: [], index: -1, op: null };
+    let timer;
+    const run = runBrowserSteps(page, context, steps, options, progress);
+    run.catch(() => {});   // if the budget wins, the abandoned run must not become an unhandled rejection
+    const budgetHit = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`budget_ms ${budget} exceeded`)), budget); });
+    try {
+        await Promise.race([run, budgetHit]);
+        return { ok: true, results: progress.results };
+    } catch (e) {
+        const cause = String(e?.message || e).split('\n')[0].slice(0, 300);
+        const ev = await browserFailureEvidence(page);
+        console.error(`[browser_flow] failed at step ${progress.index} (${progress.op}): ${cause}`);
+        return {
+            ok: false,
+            error: `${cause} [step ${progress.index}: ${progress.op}]${ev.screenshot ? ` (screenshot: ${ev.screenshot})` : ''}`,
+            failed_step: progress.index, failed_op: progress.op,
+            results: progress.results, url: ev.url, screenshot: ev.screenshot, page_text: ev.page_text,
+        };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function tool_browser_flow(args) {
     const { steps = [], options = {} } = args || {};
     const sessionId = options.session_id ? String(options.session_id) : null;
@@ -5594,14 +5657,15 @@ async function tool_browser_flow(args) {
         const s = BROWSER_SESSIONS.get(sessionId);
         if (!s) throw new Error(`browser session ${sessionId} not found (expired after 10 min idle, or closed)`);
         touchBrowserSession(sessionId);
-        let out;
+        let out, url;
         try {
-            out = await runBrowserSteps(s.page, s.context, steps, options);
+            out = await runBrowserFlowGuarded(s.page, s.context, steps, options);
+            try { url = s.page.url(); } catch {}
         } finally {
             if (options.close) await closeBrowserSession(sessionId);
             else touchBrowserSession(sessionId);
         }
-        return asJsonContent({ ok: true, session_id: sessionId, session_open: !options.close, results: out, url: options.close ? undefined : s.page.url() });
+        return asJsonContent({ ...out, session_id: sessionId, session_open: !options.close, url: options.close ? undefined : (out.url || url) });
     }
 
     if (!Array.isArray(steps)) throw new Error('steps[] must be an array');
@@ -5655,33 +5719,88 @@ async function tool_browser_flow(args) {
         BROWSER_SESSIONS.set(id, { browser, context, page, timer: null });
         touchBrowserSession(id);
         console.error(`[browser_flow] session ${id} opened`);
-        let out;
-        try {
-            out = await runBrowserSteps(page, context, steps, options);
-        } catch (e) {
-            // keep the session so the caller can inspect/recover; report the error
-            touchBrowserSession(id);
-            return asJsonContent({ ok: false, session_id: id, session_open: true, error: String(e?.message || e), url: page.url() });
-        }
+        // on failure the session stays open so the caller can inspect/recover
+        const out = await runBrowserFlowGuarded(page, context, steps, options);
         touchBrowserSession(id);
-        return asJsonContent({ ok: true, session_id: id, session_open: true, results: out, url: page.url() });
+        return asJsonContent({ ...out, session_id: id, session_open: true, url: out.url || page.url() });
     }
 
-    let results;
+    let out;
     try {
-        results = await runBrowserSteps(page, context, steps, options);
+        out = await runBrowserFlowGuarded(page, context, steps, options);
     } finally {
         await browser.close();
     }
-    return asJsonContent({ ok: true, results });
+    return asJsonContent(out);
 }
 
-async function runBrowserSteps(page, context, steps, options = {}) {
+// Text matching for wait_for_text / assert_text: `pattern` is a regex source, `text` a literal.
+function textMatcherArgs(step) {
+    if (step.pattern == null && step.text == null) throw new Error(`${step.op} requires pattern or text`);
+    const src = step.pattern != null ? String(step.pattern) : String(step.text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    new RegExp(src, step.flags ?? 'i');   // validate here, not in the page
+    return { src, flags: step.flags ?? 'i', sel: step.selector || null };
+}
+
+// capture_network: listeners live on the page, so captures survive across calls in a session.
+function startNetworkCapture(page, step) {
+    if (!step.url_pattern) throw new Error('capture_network requires url_pattern');
+    const cap = {
+        rx: new RegExp(step.url_pattern, 'i'),
+        maxBody: Number(step.max_body_bytes) > 0 ? Number(step.max_body_bytes) : 100000,
+        includeBody: step.include_body !== false,
+        entries: [], byReq: new WeakMap(), seq: 0,
+    };
+    page.__flowCapture = cap;
+    if (!page.__flowCaptureHooked) {
+        page.__flowCaptureHooked = true;
+        page.on('request', req => {
+            const c = page.__flowCapture;
+            if (!c || !c.rx.test(req.url())) return;
+            const e = { id: ++c.seq, method: req.method(), url: req.url().slice(0, 300), status: 'pending',
+                started_at: new Date().toISOString(), t0: Date.now(), request_bytes: (req.postData() || '').length };
+            c.entries.push(e);
+            if (c.entries.length > 200) c.entries.shift();
+            c.byReq.set(req, e);
+        });
+        page.on('requestfinished', async req => {
+            const c = page.__flowCapture; const e = c?.byReq.get(req);
+            if (!e) return;
+            try {
+                const res = await req.response();
+                e.http_status = res ? res.status() : null;
+                if (res && c.includeBody) {
+                    const body = await res.text();
+                    e.body_bytes = body.length;
+                    e.body = body.slice(0, c.maxBody);
+                    e.body_truncated = body.length > c.maxBody;
+                }
+            } catch (err) { e.body_error = String(err?.message || err).slice(0, 200); }
+            e.ms = Date.now() - e.t0;
+            e.status = 'done';
+        });
+        page.on('requestfailed', req => {
+            const c = page.__flowCapture; const e = c?.byReq.get(req);
+            if (!e) return;
+            e.ms = Date.now() - e.t0;
+            e.status = 'failed';
+            e.failure = req.failure()?.errorText || 'failed';
+        });
+    }
+    return cap;
+}
+
+async function runBrowserSteps(page, context, steps, options = {}, progress = { results: [] }) {
     const jitter = Number(options.jitter_ms || 0);
-    const results = [];
+    const results = progress.results;
     {
-        for (const step of steps) {
+        for (const [stepIndex, step] of steps.entries()) {
             const op = (step.op || '').toLowerCase();
+            progress.index = stepIndex;
+            progress.op = op || '(none)';
+            if (!BROWSER_FLOW_OPS.includes(op)) {
+                throw new Error(`unknown op "${step.op}" — valid: ${BROWSER_FLOW_OPS.join(', ')}`);
+            }
 
             if (op === 'goto' || op === 'navigate') {
                 if (!step.url) throw new Error('goto requires url');
@@ -5707,10 +5826,81 @@ async function runBrowserSteps(page, context, steps, options = {}) {
                 await page.type(step.selector, String(step.text ?? ''), { delay: step.delay_ms || 20 });
                 results.push({ op: 'type', selector: step.selector });
 
-            } else if (op === 'wait_for') {
+            } else if (op === 'wait_for' || op === 'wait') {
+                // `wait` is an alias; the pause can be given as ms or delay_ms
+                const pause = Number(step.ms ?? step.delay_ms ?? 0);
                 if (step.selector) await page.waitForSelector(step.selector, { timeout: step.timeout_ms || 15000 });
-                if (step.ms) await new Promise(r => setTimeout(r, step.ms));
-                results.push({ op: 'wait_for' });
+                if (pause > 0) await new Promise(r => setTimeout(r, pause));
+                results.push({ op, ...(step.selector ? { selector: step.selector } : {}), ...(pause > 0 ? { ms: pause } : {}) });
+
+            } else if (op === 'wait_for_text') {
+                // Wait until the text (regex `pattern` or literal `text`) is on the page — or gone, with absent:true.
+                const m = textMatcherArgs(step);
+                const absent = !!step.absent;
+                const t0 = Date.now();
+                const handle = await page.waitForFunction(({ src, flags, sel, absent }) => {
+                    const el = sel ? document.querySelector(sel) : document.body;
+                    const txt = el ? el.innerText : '';
+                    const hit = txt.match(new RegExp(src, flags));
+                    if (absent) return hit ? false : true;
+                    return hit ? hit[0] : false;
+                }, { ...m, absent }, { timeout: step.timeout_ms || 30000, polling: 500 });
+                const value = await handle.jsonValue();
+                results.push({ op, pattern: m.src, ...(absent ? { absent: true } : { matched: String(value).slice(0, 200) }), waited_ms: Date.now() - t0 });
+
+            } else if (op === 'assert_text') {
+                // Fail the flow unless the text is present (default) — or, with present:false, absent.
+                const m = textMatcherArgs(step);
+                const want = step.present !== false;
+                const found = await page.evaluate(({ src, flags, sel }) => {
+                    const el = sel ? document.querySelector(sel) : document.body;
+                    const hit = (el ? el.innerText : '').match(new RegExp(src, flags));
+                    return hit ? hit[0] : null;
+                }, m);
+                if (want && found == null) throw new Error(`assert_text: /${m.src}/ not found${m.sel ? ` in ${m.sel}` : ''}`);
+                if (!want && found != null) throw new Error(`assert_text: /${m.src}/ found ("${String(found).slice(0, 80)}") but should be absent`);
+                results.push({ op, pattern: m.src, present: want, ...(found != null ? { matched: String(found).slice(0, 200) } : {}) });
+
+            } else if (op === 'press') {
+                if (!step.key) throw new Error('press requires key (e.g. "Enter", "Escape")');
+                if (step.selector) await page.press(step.selector, String(step.key), { timeout: step.timeout_ms || 15000 });
+                else await page.keyboard.press(String(step.key));
+                results.push({ op, key: step.key, ...(step.selector ? { selector: step.selector } : {}) });
+
+            } else if (op === 'extract_all') {
+                if (!step.selector) throw new Error('extract_all requires selector');
+                const kind = (step.kind || 'text').toLowerCase();
+                const limit = Number(step.limit) > 0 ? Number(step.limit) : 200;
+                const maxChars = Number(step.max_chars) > 0 ? Number(step.max_chars) : 2000;
+                const items = await page.$$eval(step.selector, (els, { kind, limit, maxChars }) =>
+                    els.slice(0, limit).map(el => String(kind === 'html' ? el.innerHTML : el.innerText).slice(0, maxChars)),
+                    { kind, limit, maxChars });
+                const count = await page.$$eval(step.selector, els => els.length);
+                results.push({ op, selector: step.selector, kind, count, items });
+
+            } else if (op === 'capture_network') {
+                // Start recording requests whose URL matches url_pattern (regex). Read them with read_network.
+                const cap = startNetworkCapture(page, step);
+                results.push({ op, url_pattern: cap.rx.source, max_body_bytes: cap.maxBody, include_body: cap.includeBody });
+
+            } else if (op === 'read_network') {
+                // Return captured requests; optionally wait (timeout_ms) until `min` (default 1) matching ones have finished.
+                const cap = page.__flowCapture;
+                if (!cap) throw new Error('read_network: no capture running — add a capture_network step first');
+                const rx = step.url_pattern ? new RegExp(step.url_pattern, 'i') : null;
+                const pick = () => cap.entries.filter(e => !rx || rx.test(e.url));
+                const min = Number(step.min) > 0 ? Number(step.min) : 1;
+                const wait = Number(step.timeout_ms) || 0;
+                const t0 = Date.now();
+                while (wait && pick().filter(e => e.status !== 'pending').length < min && Date.now() - t0 < wait) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                const entries = pick().slice(-(Number(step.limit) > 0 ? Number(step.limit) : 50))
+                    .map(({ t0: _t0, ...e }) => (e.status === 'pending' ? { ...e, pending_ms: Date.now() - _t0 } : e));
+                if (wait && step.require && entries.filter(e => e.status !== 'pending').length < min) {
+                    throw new Error(`read_network: fewer than ${min} finished request(s) matching ${rx ? rx.source : cap.rx.source} after ${wait} ms`);
+                }
+                results.push({ op, count: entries.length, entries });
 
             } else if (op === 'screenshot') {
                 const wantInline =
@@ -5836,7 +6026,7 @@ async function runBrowserSteps(page, context, steps, options = {}) {
                 results.push({ op: 'set_files', selector: sel, count: files.length });
 
             } else {
-                results.push({ op, skipped: true });
+                throw new Error(`op "${op}" is listed but not implemented`);
             }
 
         }
