@@ -209,12 +209,16 @@ function parseItinerary(text) {
 // ---------------------------------------------------------------- alerts
 
 const dayLabel = (d) => new Date(`${d}T00:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
-const fareKey = (r) => `${r.fare_basis || "?"} | ${r.booking_codes || "?"}`;
+// The alert compares fare basis only: for the same AA Basic fare Matrix shows
+// booking code B on one run and O (the bucket it sells from) on the next, while
+// the fare basis' first letter already carries the bucket (ONN4C8B4 → O).
+const fareKey = (r) => r.fare_basis || "?";
+const fareLabel = (r) => `${r.fare_basis || "?"} (${r.booking_codes || "?"})`;
 
 async function pushChange(w, pair, prev, cur) {
     const title = `✈️ ${w.label}: fare changed — ${dayLabel(pair.outbound_date)} → ${dayLabel(pair.return_date)}`;
     const body = [
-        `Fare basis/class: ${fareKey(prev)} → ${fareKey(cur)}`,
+        `Fare basis (class): ${fareLabel(prev)} → ${fareLabel(cur)}`,
         `Matrix total: €${prev.total} → €${cur.total}${cur.base_fare != null ? ` (base €${cur.base_fare}, YQ/YR €${cur.yq + cur.yr})` : ""}`,
         cur.flights ? `Flights: ${cur.flights}` : null,
         "The previous fare bucket is no longer the cheapest — the price may follow.",
@@ -269,7 +273,7 @@ async function main() {
                     res = await matrixSearch(args);
                 }
                 Object.assign(row, res.itinerary, { rules: res.rules ? { categories: res.rules } : null });
-                log(`#${w.id} ${when}: €${row.total} ${row.flights || row.carriers} | ${fareKey(row)} | base €${row.base_fare} YQ ${row.yq} YR ${row.yr} tax €${row.taxes}`
+                log(`#${w.id} ${when}: €${row.total} ${row.flights || row.carriers} | ${fareLabel(row)} | base €${row.base_fare} YQ ${row.yq} YR ${row.yr} tax €${row.taxes}`
                     + ` | ${res.pick.listed} listed | ${Math.round((Date.now() - t0) / 1000)} s` + (res.rules_error ? ` | rules: ${res.rules_error}` : ""));
             } catch (err) {
                 failures++;
@@ -290,7 +294,7 @@ async function main() {
                     orderBy: { column: "checked_at", ascending: false }, limit: 1,
                 }))[0];
                 if (prev && fareKey(prev) !== fareKey(row)) {
-                    row.alert_reason = `fare ${fareKey(prev)} → ${fareKey(row)}`;
+                    row.alert_reason = `fare ${fareLabel(prev)} → ${fareLabel(row)}`;
                     try { await pushChange(w, pair, prev, row); row.alerted = true; alerts++; }
                     catch (err) { log(`#${w.id} ${when}: push failed: ${err.message}`); }
                 }
