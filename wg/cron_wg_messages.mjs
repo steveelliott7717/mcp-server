@@ -5,12 +5,16 @@
 import dotenv from "dotenv";
 dotenv.config({ path: "/opt/supabase-mcp/custom/.env" });
 
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { callTool } from "./mcp.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_FILE = path.join(__dirname, "session.json");
+// Per-conversation fingerprint of the inbox list row, so unchanged threads are not re-opened every run.
+const STATE_FILE = path.join(__dirname, ".inbox_state.json");
+const FULL_SCAN = String(process.env.WG_INBOX_FULL || "").toLowerCase() === "true";
 
 const PLAYWRIGHT_EXECUTABLE = "/opt/supabase-mcp/custom/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -18,6 +22,15 @@ const NACHRICHTEN_URL = "https://www.wg-gesucht.de/nachrichten.html";
 
 function log(msg) { console.log(`[wg_messages] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function loadInboxState() {
+    try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return {}; }
+}
+
+function saveInboxState(state) {
+    try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
+    catch (e) { log(`  → Could not write inbox state: ${e.message}`); }
+}
 
 function normalizeTitle(value = "") {
     return String(value)
@@ -239,6 +252,8 @@ async function main() {
                     adTitle: el.querySelector(".conversations_list_ad_title")?.textContent?.trim() || "",
                     adUrl: adLink?.href?.replace(/#.*$/, "") || null,
                     timeText: el.querySelector("[class*='time'], [class*='date']")?.textContent?.trim() || "",
+                    // Whole row text (sender, title, preview, time): any new message changes it
+                    fingerprint: el.textContent?.replace(/\s+/g, " ").trim() || "",
                 };
             })
         );
@@ -246,14 +261,25 @@ async function main() {
         log(`Found ${threads.length} conversation(s)`);
         if (!threads.length) { log("Nothing to process"); return; }
 
+        const inboxState = loadInboxState();
+        if (FULL_SCAN) log("WG_INBOX_FULL set — opening every thread");
+
         const listingCandidates = await fetchListingCandidates();
         log(`Loaded ${listingCandidates.length} listing candidates for matching`);
 
         let newReceived = 0;
+        let skipped = 0;
 
         // ── 2. Process each conversation ──────────────────────────────
         for (const thread of threads) {
             if (!thread.conversationId || !thread.url) continue;
+
+            // Skip threads whose inbox row has not changed since the last run
+            if (!FULL_SCAN && thread.fingerprint && inboxState[thread.conversationId] === thread.fingerprint) {
+                skipped++;
+                continue;
+            }
+
             log(`[${thread.conversationId}] ${thread.senderName} — "${thread.adTitle.slice(0, 60)}"`);
 
             const approxTime = parseRelativeTime(thread.timeText);
@@ -345,10 +371,16 @@ async function main() {
                 }
             }
 
+            // Only remember the row once the thread was fully processed, so a crash mid-run re-opens it
+            if (thread.fingerprint) {
+                inboxState[thread.conversationId] = thread.fingerprint;
+                saveInboxState(inboxState);
+            }
+
             await sleep(800);
         }
 
-        log(`Done — ${newReceived} new received message(s) at ${new Date().toISOString()}`);
+        log(`Done — ${newReceived} new received message(s), ${skipped} unchanged thread(s) skipped at ${new Date().toISOString()}`);
 
     } finally {
         await browser.close();

@@ -8,6 +8,7 @@ gmail/const/
 poshmark/session.json
 poshmark/login_error.png
 wg/session.json
+wg/.inbox_state.json
 wg/*.png
 alditalk/session.json
 alditalk/cookies_*.json
