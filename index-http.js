@@ -5603,12 +5603,31 @@ const BROWSER_FLOW_OPS = ['goto', 'navigate', 'click', 'fill', 'type', 'press', 
 
 const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 
+// Failure screenshots go to a real directory: the service runs with PrivateTmp=yes, so a
+// /tmp path would be invisible to the crons and to anyone reading the error. Kept 7 days.
+const BROWSER_FAIL_DIR = process.env.BROWSER_FLOW_FAIL_DIR || path.join(__dirname, 'logs', 'browser_flow');
+const BROWSER_FAIL_KEEP_MS = 7 * 24 * 3600 * 1000;
+function browserFailDir() {
+    fs.mkdirSync(BROWSER_FAIL_DIR, { recursive: true });
+    const gi = path.join(BROWSER_FAIL_DIR, '.gitignore');
+    if (!fs.existsSync(gi)) fs.writeFileSync(gi, '*\n');
+    try {
+        const cutoff = Date.now() - BROWSER_FAIL_KEEP_MS;
+        for (const f of fs.readdirSync(BROWSER_FAIL_DIR)) {
+            if (!f.endsWith('.png')) continue;
+            const fp = path.join(BROWSER_FAIL_DIR, f);
+            if (fs.statSync(fp).mtimeMs < cutoff) fs.unlinkSync(fp);
+        }
+    } catch {}
+    return BROWSER_FAIL_DIR;
+}
+
 // On failure: screenshot to a file (path only, never inline) + capped page text.
 async function browserFailureEvidence(page) {
     const ev = { url: null, screenshot: null, page_text: null };
     try { ev.url = page.url(); } catch {}
     try {
-        const file = path.join(os.tmpdir(), `browser_flow-fail-${Date.now()}.png`);
+        const file = path.join(browserFailDir(), `fail-${new Date().toISOString().replace(/[:.]/g, '-')}.png`);
         await page.screenshot({ path: file, timeout: 5000 });
         ev.screenshot = file;
     } catch {}
