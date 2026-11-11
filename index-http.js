@@ -1385,7 +1385,29 @@ function coerceRows(input) {
     }
     if (out.length) return out;
   }
-  throw new Error('invalid data: expected object, array, JSON array, or NDJSON string');
+  throw new Error("invalid data: the row payload must be sent under the top-level 'data' key (not 'body'/'record'/'filter'), as a JSON object, an array of objects, a JSON string, or an NDJSON string");
+}
+
+/**
+ * Write payload key normalization.
+ * Clients driving this server through the OpenAPI facade routinely put the row
+ * payload under an HTTP-shaped key (`body`) or a REST-shaped one (`record`,
+ * `rows`, `values`) instead of `data`. Accept those as aliases so a write does
+ * not fail on key naming alone; `data` always wins when both are present.
+ */
+const WRITE_PAYLOAD_ALIASES = ['body', 'record', 'records', 'rows', 'values', 'payload'];
+function normalizeWriteArgs(args) {
+  if (!args || typeof args !== 'object') return args;
+  if (args.data !== undefined && args.data !== null) return args;
+  for (const k of WRITE_PAYLOAD_ALIASES) {
+    const v = args[k];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== 'object' && typeof v !== 'string') continue;
+    const out = { ...args, data: v, _payload_key_alias: k };
+    delete out[k];
+    return out;
+  }
+  return args;
 }
 
 /** Remove PK fields from a row to form an update patch */
@@ -2933,6 +2955,7 @@ function hasMathOps(p) {
 async function tool_insert_data(args) {
     try {
         const t0 = Date.now();
+        args = normalizeWriteArgs(args);
         const {
             schema: sArg,
             table: tArg,
@@ -3058,6 +3081,7 @@ async function prefetchExistingByKeys(schema, table, keyCols, rows) {
 async function tool_upsert_data(args) {
     try {
         const t0 = Date.now();
+        args = normalizeWriteArgs(args);
         const {
             schema: sArg,
             table: tArg,
@@ -3254,6 +3278,7 @@ async function tool_upsert_data(args) {
 async function tool_update_data(args) {
     try {
         const t0 = Date.now();
+        args = normalizeWriteArgs(args);
         const {
             schema: sArg,
             table: tArg,
